@@ -34,7 +34,7 @@ Changes:
 {code_changes}
 """
         response = self.client.responses.create(
-            model="gpt-5.6-sol",
+            model="gpt-5.6-luna",
             input=prompt,
         )
         return response.output_text
