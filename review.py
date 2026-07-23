@@ -23,7 +23,16 @@ with urllib.request.urlopen(
     changed_files = json.load(response)
 
 file_list = "\n".join(f"- {file['filename']}" for file in changed_files)
-comment = f"AI Code Review triggered successfully\n\nChanged files:\n{file_list}"
+patches = "\n\n".join(
+    f"### {file['filename']}\n```diff\n"
+    f"{file.get('patch', 'Patch unavailable for this file.')}\n```"
+    for file in changed_files
+)
+comment = (
+    f"AI Code Review triggered successfully\n\n"
+    f"Changed files:\n{file_list}\n\n"
+    f"Patches:\n\n{patches}"
+)
 
 comments_url = f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments"
 comment_request = urllib.request.Request(
