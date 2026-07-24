@@ -1,7 +1,8 @@
 import sys
 
-from github_client import GitHubClient
-from reviewer import OpenAIReviewer
+from src.github_client import GitHubClient
+from src.reviewer import OpenAIReviewer
+from src.formatter import format_review
 
 
 def main():
@@ -10,7 +11,8 @@ def main():
 
     try:
         reviewer = OpenAIReviewer()
-        review = reviewer.review(changes)
+        result = reviewer.review(changes)
+        review = format_review(result)
     except Exception as error:
         print(f"AI review failed: {error}", file=sys.stderr)
         github.post_comment(
