@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import re
 from typing import Protocol
 
 from dotenv import load_dotenv
@@ -99,10 +100,11 @@ class OpenAIJudge:
 def load_inputs(
     case_id: str,
     provider: str,
+    run_name: str,
     runs_dir: Path = RUNS_DIR,
     golden_dir: Path = GOLDEN_DIR,
 ) -> tuple[list[dict], list[dict]]:
-    result_path = runs_dir / provider.lower() / case_id / "result.json"
+    result_path = runs_dir / provider.lower() / run_name / case_id / "result.json"
     golden_path = golden_dir / f"{case_id}.json"
 
     if not result_path.is_file():
@@ -233,16 +235,26 @@ async def async_main() -> None:
     )
     parser.add_argument("--case-id", required=True)
     parser.add_argument("--provider", required=True)
+    parser.add_argument("--run-name", required=True)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.provider):
+        parser.error("Provider may contain only letters, numbers, '-' and '_'")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_name):
+        parser.error("Run name may contain only letters, numbers, '-' and '_'")
+
     provider = args.provider.lower()
-    case_dir = RUNS_DIR / provider / args.case_id
+    case_dir = RUNS_DIR / provider / args.run_name / args.case_id
     output_path = case_dir / "evaluation.json"
     if output_path.exists() and not args.force:
         parser.error(f"Evaluation already exists: {output_path}; use --force")
 
-    candidates, golden_comments = load_inputs(args.case_id, provider)
+    candidates, golden_comments = load_inputs(
+        args.case_id,
+        provider,
+        args.run_name,
+    )
     judge = OpenAIJudge()
     comparisons = len(candidates) * len(golden_comments)
     print(
@@ -252,6 +264,7 @@ async def async_main() -> None:
     evaluation = await evaluate(judge, candidates, golden_comments)
     evaluation["case_id"] = args.case_id
     evaluation["provider"] = provider
+    evaluation["run_name"] = args.run_name
     evaluation["judge_model"] = judge.model
 
     case_dir.mkdir(parents=True, exist_ok=True)

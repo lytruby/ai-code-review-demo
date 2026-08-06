@@ -15,7 +15,7 @@ class FakeJudge:
 
 
 def test_load_inputs(tmp_path):
-    case_dir = tmp_path / "runs" / "kimi" / "example-1"
+    case_dir = tmp_path / "runs" / "kimi" / "sop-v1" / "example-1"
     case_dir.mkdir(parents=True)
     (case_dir / "result.json").write_text(
         json.dumps({"issues": [{"description": "Found real bug"}]}),
@@ -33,6 +33,7 @@ def test_load_inputs(tmp_path):
     candidates, golden = load_inputs(
         "example-1",
         "KIMI",
+        "sop-v1",
         runs_dir=tmp_path / "runs",
         golden_dir=golden_dir,
     )

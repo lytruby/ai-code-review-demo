@@ -42,6 +42,7 @@ def test_review_results_do_not_share_issue_lists():
 def test_review_result_from_valid_dict():
     result = review_result_from_dict(
         {
+            "status": "complete",
             "summary": "One issue found",
             "issues": [
                 {
@@ -69,6 +70,7 @@ def test_review_result_rejects_invalid_severity():
     with pytest.raises(ValueError, match="severity"):
         review_result_from_dict(
             {
+                "status": "complete",
                 "summary": "One issue found",
                 "issues": [
                     {
@@ -86,6 +88,7 @@ def test_review_result_rejects_missing_fields():
     with pytest.raises(ValueError, match="suggestion"):
         review_result_from_dict(
             {
+                "status": "complete",
                 "summary": "One issue found",
                 "issues": [
                     {
@@ -94,5 +97,16 @@ def test_review_result_rejects_missing_fields():
                         "description": "Possible division by zero",
                     }
                 ],
+            }
+        )
+
+
+def test_review_result_rejects_needs_context_status():
+    with pytest.raises(ValueError, match="status must be complete"):
+        review_result_from_dict(
+            {
+                "status": "needs_context",
+                "summary": "More context required",
+                "issues": [],
             }
         )

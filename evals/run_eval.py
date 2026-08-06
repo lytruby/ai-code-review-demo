@@ -72,15 +72,47 @@ def checkout_pr(metadata: dict, destination: Path) -> None:
     _run_git(["checkout", "--detach", actual_head], destination)
 
 
-def save_result(run_dir: Path, case_id: str, result) -> Path:
+def save_result(
+    run_dir: Path,
+    case_id: str,
+    result,
+    trace: list[dict] | None = None,
+) -> Path:
     case_dir = run_dir / case_id
     case_dir.mkdir(parents=True, exist_ok=False)
     result_path = case_dir / "result.json"
+    output = asdict(result)
+    output["trace"] = trace or []
     result_path.write_text(
-        json.dumps(asdict(result), indent=2, ensure_ascii=False) + "\n",
+        json.dumps(output, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     return result_path
+
+
+def save_failure(
+    run_dir: Path,
+    case_id: str,
+    error: Exception,
+    trace: list[dict] | None = None,
+) -> Path:
+    case_dir = run_dir / case_id
+    case_dir.mkdir(parents=True, exist_ok=False)
+    error_path = case_dir / "error.json"
+    error_path.write_text(
+        json.dumps(
+            {
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "trace": trace or [],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return error_path
 
 
 def run_case(
@@ -96,9 +128,25 @@ def run_case(
         repository_root = Path(temp_dir)
         checkout(metadata, repository_root)
         reviewer = reviewer_factory(repository_root=repository_root)
-        result = reviewer.review(changes)
+        try:
+            result = reviewer.review(changes)
+        except Exception as error:
+            error_path = save_failure(
+                run_dir,
+                case_id,
+                error,
+                trace=getattr(reviewer, "last_trace", []),
+            )
+            raise RuntimeError(
+                f"{error}. Failure trace saved to {error_path}"
+            ) from error
 
-    return save_result(run_dir, case_id, result)
+    return save_result(
+        run_dir,
+        case_id,
+        result,
+        trace=getattr(reviewer, "last_trace", []),
+    )
 
 
 def main() -> None:
@@ -111,6 +159,11 @@ def main() -> None:
         required=True,
         help="Model provider name used as the output directory, for example kimi.",
     )
+    parser.add_argument(
+        "--run-name",
+        required=True,
+        help="Agent version or experiment name, for example baseline or sop-v1.",
+    )
     parser.add_argument("--fixtures", type=Path, default=FIXTURES_DIR)
     parser.add_argument("--runs", type=Path, default=RUNS_DIR)
     args = parser.parse_args()
@@ -121,9 +174,11 @@ def main() -> None:
 
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.provider):
         parser.error("Provider may contain only letters, numbers, '-' and '_'")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_name):
+        parser.error("Run name may contain only letters, numbers, '-' and '_'")
 
-    run_dir = args.runs / args.provider.lower()
-    print(f"run {args.case_id}")
+    run_dir = args.runs / args.provider.lower() / args.run_name
+    print(f"run {args.case_id} ({args.provider.lower()}/{args.run_name})")
     result_path = run_case(fixture_dir, run_dir)
     print(f"saved {result_path}")
 

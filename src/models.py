@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 Severity = Literal["low", "medium", "high"]
+WorkflowStatus = Literal["complete"]
 
 
 @dataclass
@@ -16,11 +17,16 @@ class ReviewIssue:
 class ReviewResult:
     summary: str
     issues: list[ReviewIssue] = field(default_factory=list)
+    status: WorkflowStatus = "complete"
 
 
 def review_result_from_dict(data: dict) -> ReviewResult:
     if not isinstance(data, dict):
         raise ValueError("Review result must be an object")
+
+    status = data.get("status")
+    if status != "complete":
+        raise ValueError("Review status must be complete")
 
     summary = data.get("summary")
     if not isinstance(summary, str):
@@ -59,4 +65,4 @@ def review_result_from_dict(data: dict) -> ReviewResult:
             )
         )
 
-    return ReviewResult(summary=summary, issues=issues)
+    return ReviewResult(summary=summary, issues=issues, status=status)

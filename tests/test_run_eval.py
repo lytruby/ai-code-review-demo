@@ -48,6 +48,9 @@ def test_run_case_uses_checked_out_repository(tmp_path):
     class FakeReviewer:
         def __init__(self, repository_root):
             observed["repository_root"] = repository_root
+            self.last_trace = [
+                {"type": "model_response", "content": "done", "tool_calls": []}
+            ]
 
         def review(self, changes):
             observed["changes"] = changes
@@ -75,6 +78,7 @@ def test_run_case_uses_checked_out_repository(tmp_path):
     assert observed["checkout_metadata"]["head_sha"] == "head123"
     assert observed["changes"][0]["patch"] == "+return value"
     assert saved["issues"][0]["severity"] == "medium"
+    assert saved["trace"][0]["type"] == "model_response"
 
 
 def test_checkout_pr_rejects_changed_head(tmp_path, monkeypatch):
@@ -94,3 +98,38 @@ def test_checkout_pr_rejects_changed_head(tmp_path, monkeypatch):
             },
             tmp_path,
         )
+
+
+def test_run_case_saves_trace_when_review_fails(tmp_path):
+    fixture = make_fixture(tmp_path)
+    run_dir = tmp_path / "runs" / "test-run"
+
+    def fake_checkout(metadata, destination):
+        pass
+
+    class FailingReviewer:
+        def __init__(self, repository_root):
+            self.last_trace = [
+                {
+                    "type": "model_response",
+                    "content": '{"status":"needs_context"}',
+                    "tool_calls": [],
+                }
+            ]
+
+        def review(self, changes):
+            raise ValueError("workflow turn limit")
+
+    with pytest.raises(RuntimeError, match="Failure trace saved"):
+        run_case(
+            fixture,
+            run_dir,
+            reviewer_factory=FailingReviewer,
+            checkout=fake_checkout,
+        )
+
+    error_path = run_dir / "example-1" / "error.json"
+    saved = json.loads(error_path.read_text(encoding="utf-8"))
+    assert saved["error_type"] == "ValueError"
+    assert saved["error"] == "workflow turn limit"
+    assert saved["trace"][0]["type"] == "model_response"

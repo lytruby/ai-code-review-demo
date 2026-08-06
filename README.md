@@ -96,7 +96,8 @@ uv run python -m evals.fetch_fixtures --force
 ```bash
 uv run python -m evals.run_eval \
   --case-id sentry-93824 \
-  --provider kimi
+  --provider kimi \
+  --run-name sop-v1
 ```
 
 Eval runner 会：
@@ -105,15 +106,17 @@ Eval runner 会：
 2. Checkout PR 的固定 `head_sha`。
 3. 把完整代码目录交给 agent 的 `read_file` 工具。
 4. 调用 Kimi 生成 review。
-5. 保存结构化结果。
+5. 保存结构化结果和可观察轨迹（模型响应、工具调用及工具结果）。
+
+如果评审失败，同一目录下会保存 `error.json`，其中包含错误信息和失败前的可观察轨迹。
 
 结果路径：
 
 ```text
-evals/runs/kimi/sentry-93824/result.json
+evals/runs/kimi/sop-v1/sentry-93824/result.json
 ```
 
-同一 provider 和 case 的结果默认不会被覆盖。需要重新运行时，先保留或重命名旧结果，用于比较不同 agent 版本。
+`provider` 用于区分 review 模型供应商，`run-name` 用于区分 agent 版本或实验。同一 provider、run name 和 case 的结果默认不会被覆盖。
 
 可用的 case id：
 
@@ -166,13 +169,14 @@ JUDGE_MODEL=gpt-5.2
 ```bash
 uv run python -m evals.score \
   --case-id sentry-93824 \
-  --provider kimi
+  --provider kimi \
+  --run-name sop-v1
 ```
 
 评分结果保存到：
 
 ```text
-evals/runs/kimi/sentry-93824/evaluation.json
+evals/runs/kimi/sop-v1/sentry-93824/evaluation.json
 ```
 
 Scorer 按官方 benchmark 的规则，将每个 candidate 与每个 golden comment 做语义匹配，再计算 TP、FP、FN、precision、recall 和 F1。第一版暂不执行 candidate 去重。
