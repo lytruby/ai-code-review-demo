@@ -1,0 +1,9 @@
+{
+  "id": "sentry-93824",
+  "repository": "getsentry/sentry",
+  "pull_number": 93824,
+  "pr_url": "https://github.com/getsentry/sentry/pull/93824",
+  "language": "python",
+  "base_sha": "de11fb0166a7244115bb066edd65ec0d6b7e365c",
+  "head_sha": "3162ad68a5c87666788b27a44eb31235025091a9"
+}

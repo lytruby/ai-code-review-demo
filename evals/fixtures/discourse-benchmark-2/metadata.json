@@ -1,0 +1,9 @@
+{
+  "id": "discourse-benchmark-2",
+  "repository": "ai-code-review-evaluation/discourse-graphite",
+  "pull_number": 2,
+  "pr_url": "https://github.com/ai-code-review-evaluation/discourse-graphite/pull/2",
+  "language": "ruby",
+  "base_sha": "56abd247e1829cb6de82dfcc8ce04deb5f0d1e91",
+  "head_sha": "6669a2d94d76eea3b99b8c476d12b1eb66726b07"
+}

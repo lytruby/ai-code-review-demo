@@ -1,0 +1,9 @@
+{
+  "id": "keycloak-32918",
+  "repository": "keycloak/keycloak",
+  "pull_number": 32918,
+  "pr_url": "https://github.com/keycloak/keycloak/pull/32918",
+  "language": "java",
+  "base_sha": "272cfc68dcc88615396ae62ed1571918e9c58ad3",
+  "head_sha": "e944e2acf1e64421860a8e827f93ad06c169621b"
+}

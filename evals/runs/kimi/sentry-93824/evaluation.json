@@ -1,0 +1,90 @@
+{
+  "true_positives": [
+    {
+      "golden_index": 0,
+      "candidate_index": 2,
+      "confidence": 0.98,
+      "reasoning": "The candidate issue explicitly points out inconsistent metric tag keys (`shard` vs `shards`) used for the same value in related metrics, which is exactly the golden comment's concern about inconsistent metric tagging with 'shard' and 'shards'.",
+      "golden_comment": "Inconsistent metric tagging with 'shard' and 'shards'",
+      "severity": "Medium",
+      "matched_candidate": "Metrics tag inconsistency: `spans.buffer.flusher.produce` and `spans.buffer.flusher.wait_produce` use different tag keys (`shard` vs `shards`) for the same value."
+    },
+    {
+      "golden_index": 1,
+      "candidate_index": 9,
+      "confidence": 0.95,
+      "reasoning": "Both comments flag the same underlying problem: using a fixed `time.sleep` in tests leads to flaky behavior, especially in CI, and should be replaced with a condition/synchronization-based wait mechanism.",
+      "golden_comment": "Fixed sleep in tests can be flaky; wait on condition instead",
+      "severity": "Low",
+      "matched_candidate": "Test uses `time.sleep(0.1)` which introduces flakiness in CI. The sleep is added to wait for flusher threads, but there's no synchronization mechanism."
+    }
+  ],
+  "false_positives": [
+    {
+      "candidate_index": 0,
+      "candidate": "Process leak on restart: old processes are not joined/terminated before replacement. `_create_process_for_shards` stores the new process but doesn't clean up the old one, which may become a zombie."
+    },
+    {
+      "candidate_index": 1,
+      "candidate": "Thread leak for non-multiprocessing mode: `threading.Thread` doesn't have `kill()` or `terminate()`, but `_ensure_processes_alive` tries `process.kill()` only for `multiprocessing.Process`, then later calls `process.terminate()` in `join()`. Threads can't be forcefully stopped, leading to potential thread accumulation on restart."
+    },
+    {
+      "candidate_index": 3,
+      "candidate": "Potential race in `_ensure_processes_alive`: `process_restarts` is incremented after checking the threshold, so if two checks happen concurrently (though unlikely in single-threaded consumer), it could exceed `MAX_PROCESS_RESTARTS`. More importantly, the counter is never reset on success."
+    },
+    {
+      "candidate_index": 4,
+      "candidate": "Backpressure check uses `any()` logic but raises `MessageRejected()` on first bad process, without checking if other processes recovered. This may cause unnecessary consumer pauses."
+    },
+    {
+      "candidate_index": 5,
+      "candidate": "Memory check iterates all buffers but doesn't handle the case where `buffer.get_memory_info()` returns empty lists, which could cause division issues if `available` is 0."
+    },
+    {
+      "candidate_index": 6,
+      "candidate": "`join()` method has a logic bug: the deadline check inside the loop breaks out of the inner while but continues to the next process without respecting the overall deadline properly. The `remaining_time` is computed but not used for the inner while loop."
+    },
+    {
+      "candidate_index": 7,
+      "candidate": "`_create_process_for_shard` is defined but never used. The method appears to be dead code."
+    },
+    {
+      "candidate_index": 8,
+      "candidate": "The `SpanFlusher.main` static method receives `shards` list but also receives `buffer` which already knows its shards. This creates potential for inconsistency if they don't match."
+    },
+    {
+      "candidate_index": 10,
+      "candidate": "Test `test_flusher_processes_limit` doesn't actually test the multiprocessing behavior - it only checks configuration state. It doesn't verify that processes actually run or handle shards correctly."
+    }
+  ],
+  "false_negatives": [
+    {
+      "golden_index": 2,
+      "golden_comment": "Because flusher processes are created via multiprocessing.get_context('spawn').Process, they are instances of multiprocessing.context.SpawnProcess, which on POSIX is not a subclass of multiprocessing.Process, so this isinstance check will always be false and hung processes won't be killed here.",
+      "severity": "High"
+    },
+    {
+      "golden_index": 3,
+      "golden_comment": "Sleep in test_consumer.py won’t actually wait because time.sleep was monkeypatched above; consider restoring sleep or using a different sync to ensure the flusher has time to process.",
+      "severity": "Medium"
+    },
+    {
+      "golden_index": 4,
+      "golden_comment": "Breaking out of the loop when the deadline has elapsed can skip terminating remaining flusher processes, potentially leaving them running after shutdown; consider ensuring termination is attempted even if the deadline is exceeded.",
+      "severity": "Medium"
+    }
+  ],
+  "errors": [],
+  "total_candidates": 11,
+  "total_golden": 5,
+  "tp": 2,
+  "fp": 9,
+  "fn": 3,
+  "errors_count": 0,
+  "precision": 0.18181818181818182,
+  "recall": 0.4,
+  "f1": 0.25000000000000006,
+  "case_id": "sentry-93824",
+  "provider": "kimi",
+  "judge_model": "gpt-5.2"
+}

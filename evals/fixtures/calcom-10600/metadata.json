@@ -1,0 +1,9 @@
+{
+  "id": "calcom-10600",
+  "repository": "calcom/cal.com",
+  "pull_number": 10600,
+  "pr_url": "https://github.com/calcom/cal.com/pull/10600",
+  "language": "typescript",
+  "base_sha": "efa6d464a38e60ceeeb88f40668c1c4ac4bfaf54",
+  "head_sha": "54486a059cd2032042189bb565646ba4e0f6bd61"
+}

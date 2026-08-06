@@ -1,0 +1,9 @@
+{
+  "id": "grafana-79265",
+  "repository": "grafana/grafana",
+  "pull_number": 79265,
+  "pr_url": "https://github.com/grafana/grafana/pull/79265",
+  "language": "go",
+  "base_sha": "50f4e78a39914711d0d231a501ba215becf17ebc",
+  "head_sha": "bbd8c507cdf56f6b884373809e0b24abd4a2353d"
+}

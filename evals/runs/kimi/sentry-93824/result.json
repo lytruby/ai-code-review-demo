@@ -1,0 +1,71 @@
+{
+  "summary": "This PR adds multiprocessing support to the SpanFlusher, allowing multiple processes to handle different Redis shards in parallel. It introduces a `flusher_processes` configuration option and refactors the flusher to manage multiple processes. While the overall approach is sound, there are several issues related to process lifecycle management, resource leaks, error handling, and metrics consistency that need attention.",
+  "issues": [
+    {
+      "file": "src/sentry/spans/consumers/process/flusher.py",
+      "severity": "high",
+      "description": "Process leak on restart: old processes are not joined/terminated before replacement. `_create_process_for_shards` stores the new process but doesn't clean up the old one, which may become a zombie.",
+      "suggestion": "Before replacing a process in `self.processes[process_index]`, call `join()` with a timeout on the old process, then `terminate()`/`kill()` if still alive. Ensure the old process is removed from the dict only after cleanup."
+    },
+    {
+      "file": "src/sentry/spans/consumers/process/flusher.py",
+      "severity": "high",
+      "description": "Thread leak for non-multiprocessing mode: `threading.Thread` doesn't have `kill()` or `terminate()`, but `_ensure_processes_alive` tries `process.kill()` only for `multiprocessing.Process`, then later calls `process.terminate()` in `join()`. Threads can't be forcefully stopped, leading to potential thread accumulation on restart.",
+      "suggestion": "For threads, set a stop flag and wait with timeout instead of trying to kill. Consider whether thread mode should even support restarts, or document that thread restarts are best-effort."
+    },
+    {
+      "file": "src/sentry/spans/consumers/process/flusher.py",
+      "severity": "medium",
+      "description": "Metrics tag inconsistency: `spans.buffer.flusher.produce` and `spans.buffer.flusher.wait_produce` use different tag keys (`shard` vs `shards`) for the same value.",
+      "suggestion": "Use consistent tag key names. Change `spans.buffer.flusher.wait_produce` tag key from `shards` to `shard` to match the produce timer."
+    },
+    {
+      "file": "src/sentry/spans/consumers/process/flusher.py",
+      "severity": "medium",
+      "description": "Potential race in `_ensure_processes_alive`: `process_restarts` is incremented after checking the threshold, so if two checks happen concurrently (though unlikely in single-threaded consumer), it could exceed `MAX_PROCESS_RESTARTS`. More importantly, the counter is never reset on success.",
+      "suggestion": "Reset `process_restarts[process_index]` to 0 when a process is confirmed healthy, or implement a time-decay for restarts to avoid permanent failure after transient issues."
+    },
+    {
+      "file": "src/sentry/spans/consumers/process/flusher.py",
+      "severity": "medium",
+      "description": "Backpressure check uses `any()` logic but raises `MessageRejected()` on first bad process, without checking if other processes recovered. This may cause unnecessary consumer pauses.",
+      "suggestion": "Consider whether backpressure should be per-process or global. If global, the current behavior is correct but document it. If per-process, only reject messages for shards on the unhealthy process."
+    },
+    {
+      "file": "src/sentry/spans/consumers/process/flusher.py",
+      "severity": "medium",
+      "description": "Memory check iterates all buffers but doesn't handle the case where `buffer.get_memory_info()` returns empty lists, which could cause division issues if `available` is 0.",
+      "suggestion": "Add explicit check: `if available == 0: continue` or handle appropriately to avoid ZeroDivisionError (though currently guarded by `available > 0`)."
+    },
+    {
+      "file": "src/sentry/spans/consumers/process/flusher.py",
+      "severity": "low",
+      "description": "`join()` method has a logic bug: the deadline check inside the loop breaks out of the inner while but continues to the next process without respecting the overall deadline properly. The `remaining_time` is computed but not used for the inner while loop.",
+      "suggestion": "Pass `remaining_time` to the inner while loop condition: `while process.is_alive() and (deadline is None or time.time() < deadline):` and use `min(0.1, remaining_time)` for sleep if deadline is near."
+    },
+    {
+      "file": "src/sentry/spans/consumers/process/flusher.py",
+      "severity": "low",
+      "description": "`_create_process_for_shard` is defined but never used. The method appears to be dead code.",
+      "suggestion": "Remove the unused `_create_process_for_shard` method, or use it if there's a planned feature for per-shard restart granularity."
+    },
+    {
+      "file": "src/sentry/spans/consumers/process/flusher.py",
+      "severity": "low",
+      "description": "The `SpanFlusher.main` static method receives `shards` list but also receives `buffer` which already knows its shards. This creates potential for inconsistency if they don't match.",
+      "suggestion": "Either remove `shards` parameter and derive from `buffer.assigned_shards`, or add an assertion that they match at startup."
+    },
+    {
+      "file": "tests/sentry/spans/consumers/process/test_consumer.py",
+      "severity": "low",
+      "description": "Test uses `time.sleep(0.1)` which introduces flakiness in CI. The sleep is added to wait for flusher threads, but there's no synchronization mechanism.",
+      "suggestion": "Replace `time.sleep(0.1)` with a polling loop that checks for the expected condition with a timeout, or use a threading.Event/synchronization primitive if the flusher exposes one."
+    },
+    {
+      "file": "tests/sentry/spans/consumers/process/test_consumer.py",
+      "severity": "low",
+      "description": "Test `test_flusher_processes_limit` doesn't actually test the multiprocessing behavior - it only checks configuration state. It doesn't verify that processes actually run or handle shards correctly.",
+      "suggestion": "Add assertions that verify the processes are actually alive, or submit a message and verify it gets processed by the correct shard/process."
+    }
+  ]
+}
