@@ -2,6 +2,8 @@
 
 这是一个用于学习和评测 Code Review Agent 的小型项目。当前使用固定的 GitHub PR 作为测试 case，通过 Kimi 生成 review，并与开发集的 golden comments 对比。
 
+Agent 的逐轮设计变更、失败实验和评估结论记录在 [Agent Learning Changelog](docs/agent-changelog.md)。
+
 ## 1. 准备虚拟环境
 
 项目使用 [uv](https://docs.astral.sh/uv/) 管理本地虚拟环境和依赖。
@@ -25,11 +27,17 @@ uv run python --version
 MOONSHOT_API_KEY=your_api_key_here
 KIMI_THINKING=disabled
 LLM_MAX_COMPLETION_TOKENS=2048
+LLM_DISCOVER_MAX_COMPLETION_TOKENS=4096
 LLM_TIMEOUT=120
 LLM_MAX_RETRIES=0
+LLM_TRANSIENT_RETRIES=2
+LLM_RETRY_BACKOFF_SECONDS=1
+LLM_REASONING_EFFORT=low
 ```
 
 程序使用 `python-dotenv` 自动读取 `.env`，不需要执行 `source .env`。
+
+`LLM_MAX_RETRIES=0` 关闭 SDK 内部的隐藏重试；Agent workflow 会对 timeout、connection error、HTTP 5xx 和 rate limit 显式重试最多 2 次，并将每次失败记录到 trace。退避时间默认依次为 1 秒、2 秒。
 
 `.env` 已被 `.gitignore` 排除，不应提交真实 API Key。这里需要使用 Kimi 开放平台的 API Key，不是 Kimi Code 或 Kimi 会员的 Key。
 
@@ -40,6 +48,10 @@ KIMI_THINKING=enabled
 ```
 
 使用相同 case 比较思考模式对 review 质量、速度和成本的影响。
+
+`KIMI_THINKING` 只用于 Kimi K2.x。Kimi K3 始终开启推理，程序通过顶层
+`reasoning_effort` 参数控制强度；环境变量 `LLM_REASONING_EFFORT` 支持
+`low`、`high`、`max`，默认使用 `low` 以降低延迟和 token 消耗。
 
 ## 3. 测试 Kimi 模型连接
 
@@ -104,9 +116,62 @@ Eval runner 会：
 
 1. 读取固定 fixture。
 2. Checkout PR 的固定 `head_sha`。
-3. 把完整代码目录交给 agent 的 `read_file` 工具。
-4. 调用 Kimi 生成 review。
-5. 保存结构化结果和可观察轨迹（模型响应、工具调用及工具结果）。
+3. 把完整代码目录作为只读环境交给 agent，通过 `search_code` 定位代码，再用 `read_file` 读取局部上下文。
+4. 由代码依次执行 DISCOVER、VERIFY、FINALIZE 三个阶段。
+5. VERIFY 为每个 candidate 建立独立模型调用，按需调用 `search_code` 和 `read_file`，逐条保留、修改或删除候选问题。
+6. 调用 Kimi 生成最终 review 摘要，由代码组装已验证 issues。
+7. 保存结构化结果和可观察轨迹（阶段、模型响应、finish reason、token usage、工具调用及工具结果）。
+
+固定 SHA 的 repository checkout 会缓存到 `evals/repositories/`（已加入 `.gitignore`）。第一次运行需要从 GitHub fetch；成功后相同仓库和 SHA 会直接离线复用，避免每次评测重新下载。首次 fetch 遇到临时 DNS/网络错误时会自动重试 2 次。
+
+三个阶段的状态由 Python 维护，而不是依赖模型记忆：
+
+```text
+DISCOVER atomic candidates with diff evidence
+→ ACQUIRE_CONTEXT for required_facts
+→ VERIFY keep / revise / drop
+→ FINALIZE summary
+→ COMPLETE
+```
+
+最终阶段不能新增或改写 issues；正式 issues 只来自 VERIFY 的结构化结果。
+每个 candidate 只能描述一个 claim，并携带结构化 evidence 引用。每条引用使用 `side: before | after` 标明变更侧，并包含一个连续源码片段；非连续位置或 before/after transition 必须拆成多条引用。代码会分别重建变更前后的源码，验证每条 evidence 的 side、内容和文件归属。
+
+DISCOVER 还必须列出验证该 claim 所需、但 diff 中不可见的 repository facts：
+
+```json
+{
+  "required_facts": [
+    {
+      "question": "SpansBuffer 是否保存实例级状态？",
+      "source": "repository",
+      "path": "src/sentry/spans/buffer.py",
+      "query": "class SpansBuffer"
+    }
+  ]
+}
+```
+
+每条 candidate 最多 2 个 required facts。每个 fact 使用结构化 locator：`path + query` 会在指定路径内搜索并读取首个匹配位置，只有 `path` 时直接读取文件，只有 `query` 时执行全仓库搜索并读取首个匹配位置。Required facts 非空时，VERIFY 必须使用 repository basis；空列表时必须使用 diff basis。
+
+Repository 工具分工：
+
+```text
+search_code(query, path?)
+  → 返回最多 20 个文件路径、行号和匹配行
+read_file(path, line?, context_lines?)
+  → 小文件可完整读取；大文件按中心行读取局部窗口
+```
+
+`read_file` 的 `context_lines` 默认 50、最大 100。大文件未指定 `line` 时，工具会返回总行数和再次分段读取的提示，而不是直接丢失全部上下文。两个工具都只能访问固定 checkout 的 repository 内部。
+
+VERIFY 的每条 decision 必须声明判断依据：
+
+```json
+{"basis": "diff | repository"}
+```
+
+`basis=repository` 必须在该 candidate 的独立轨迹中至少有一次成功的 `search_code` 或 `read_file`，否则 workflow 会拒绝 verdict 并要求重试。`basis=diff` 表示只能依据 supplied diff，不应声称仓库中的定义、调用点、继承或运行时状态。
 
 如果评审失败，同一目录下会保存 `error.json`，其中包含错误信息和失败前的可观察轨迹。
 
@@ -179,7 +244,18 @@ uv run python -m evals.score \
 evals/runs/kimi/sop-v1/sentry-93824/evaluation.json
 ```
 
-Scorer 按官方 benchmark 的规则，将每个 candidate 与每个 golden comment 做语义匹配，再计算 TP、FP、FN、precision、recall 和 F1。第一版暂不执行 candidate 去重。
+Scorer 先让 Judge 对每个 candidate 与每个 golden comment 做语义判断，再执行一对一最大匹配：优先最大化 TP 数量，TP 数相同时最大化总 confidence。未进入最终匹配的 candidate 计为 FP；如果它也匹配某个已占用的 golden，则标记为 `duplicate_match`，不会在评分前静默去重。Evaluation 同时保存全部 `pairwise_judgments`，并强制校验 `TP + FP = total_candidates`、`TP + FN = total_golden`。
+
+如果要连续运行并评分一个或多个 case，可以使用 suite 命令：
+
+```bash
+uv run python -m evals.run_suite \
+  --case-id sentry-93824 grafana-79265 calcom-10600 \
+  --provider kimi \
+  --run-name verified-claims-v1
+```
+
+每个 case 会先运行 review，再执行评分；任何一步失败时 suite 会停止，避免继续产生无效调用费用。
 
 ## 8. 运行自动测试
 

@@ -2,7 +2,14 @@ import json
 
 import pytest
 
-from evals.run_eval import checkout_pr, load_fixture, run_case
+from evals.run_eval import (
+    checkout_pr,
+    load_fixture,
+    prepare_cached_repository,
+    run_case,
+    save_failure,
+    save_result,
+)
 from src.models import ReviewIssue, ReviewResult
 
 
@@ -100,6 +107,26 @@ def test_checkout_pr_rejects_changed_head(tmp_path, monkeypatch):
         )
 
 
+def test_prepare_cached_repository_reuses_locked_checkout(tmp_path):
+    metadata = {
+        "repository": "example/repo",
+        "head_sha": "abc123",
+    }
+    calls = []
+
+    def fake_checkout(received_metadata, destination):
+        calls.append(received_metadata)
+        (destination / "example.py").write_text("value = 1\n", encoding="utf-8")
+
+    first = prepare_cached_repository(metadata, tmp_path / "cache", fake_checkout)
+    second = prepare_cached_repository(metadata, tmp_path / "cache", fake_checkout)
+
+    assert first == second
+    assert (second / "example.py").read_text(encoding="utf-8") == "value = 1\n"
+    assert (second / ".benchmark-head-sha").read_text().strip() == "abc123"
+    assert len(calls) == 1
+
+
 def test_run_case_saves_trace_when_review_fails(tmp_path):
     fixture = make_fixture(tmp_path)
     run_dir = tmp_path / "runs" / "test-run"
@@ -133,3 +160,23 @@ def test_run_case_saves_trace_when_review_fails(tmp_path):
     assert saved["error_type"] == "ValueError"
     assert saved["error"] == "workflow turn limit"
     assert saved["trace"][0]["type"] == "model_response"
+
+
+def test_failed_run_can_be_retried_in_same_directory(tmp_path):
+    run_dir = tmp_path / "runs" / "test-run"
+
+    first_error = save_failure(run_dir, "example-1", TimeoutError("first"))
+    second_error = save_failure(run_dir, "example-1", TimeoutError("second"))
+    result_path = save_result(
+        run_dir,
+        "example-1",
+        ReviewResult(summary="Recovered"),
+    )
+
+    assert first_error.name == "error.json"
+    assert second_error.name == "error-2.json"
+    assert result_path.name == "result.json"
+    assert json.loads(result_path.read_text(encoding="utf-8"))["summary"] == "Recovered"
+
+    with pytest.raises(FileExistsError, match="Result already exists"):
+        save_result(run_dir, "example-1", ReviewResult(summary="Do not overwrite"))

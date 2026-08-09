@@ -1,6 +1,13 @@
 import pytest
 
-from src.models import ReviewIssue, ReviewResult, review_result_from_dict
+from src.models import (
+    CandidateIssue,
+    EvidenceRef,
+    RequiredFact,
+    ReviewIssue,
+    ReviewResult,
+    review_result_from_dict,
+)
 
 
 def test_review_result_basic():
@@ -19,6 +26,28 @@ def test_review_result_basic():
 
     assert empty_result.issues == []
     assert result.issues[0].severity == "high"
+
+
+def test_candidate_issue_keeps_atomic_claim_and_evidence():
+    candidate = CandidateIssue(
+        file="test.py",
+        severity="medium",
+        claim="Division can receive a zero denominator",
+        evidence=[EvidenceRef(side="after", text="return a / b")],
+        required_facts=[
+            RequiredFact(
+                question="Can b be zero?",
+                source="repository",
+                path="test.py",
+                query="divide(",
+            )
+        ],
+    )
+
+    assert candidate.claim == "Division can receive a zero denominator"
+    assert candidate.evidence == [EvidenceRef(side="after", text="return a / b")]
+    assert candidate.required_facts[0].path == "test.py"
+    assert candidate.required_facts[0].query == "divide("
 
 
 def test_review_results_do_not_share_issue_lists():

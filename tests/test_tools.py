@@ -2,7 +2,13 @@ import json
 
 import pytest
 
-from src.tools import READ_FILE_TOOL, execute_tool, read_file
+from src.tools import (
+    READ_FILE_TOOL,
+    SEARCH_CODE_TOOL,
+    execute_tool,
+    read_file,
+    search_code,
+)
 
 
 def test_read_file_tool_schema():
@@ -11,6 +17,14 @@ def test_read_file_tool_schema():
     assert READ_FILE_TOOL["strict"] is True
     assert READ_FILE_TOOL["parameters"]["required"] == ["path"]
     assert READ_FILE_TOOL["parameters"]["additionalProperties"] is False
+    assert "line" in READ_FILE_TOOL["parameters"]["properties"]
+    assert "context_lines" in READ_FILE_TOOL["parameters"]["properties"]
+
+
+def test_search_code_tool_schema():
+    assert SEARCH_CODE_TOOL["name"] == "search_code"
+    assert SEARCH_CODE_TOOL["parameters"]["required"] == ["query"]
+    assert SEARCH_CODE_TOOL["parameters"]["additionalProperties"] is False
 
 
 def test_execute_tool_reads_file(tmp_path):
@@ -19,7 +33,15 @@ def test_execute_tool_reads_file(tmp_path):
 
     output = execute_tool("read_file", '{"path": "example.py"}', tmp_path)
 
-    assert json.loads(output) == {"ok": True, "content": "print('hello')\n"}
+    assert json.loads(output) == {
+        "ok": True,
+        "path": "example.py",
+        "start_line": 1,
+        "end_line": 1,
+        "total_lines": 1,
+        "content": "print('hello')\n",
+        "truncated": False,
+    }
 
 
 def test_execute_tool_rejects_invalid_arguments(tmp_path):
@@ -42,7 +64,7 @@ def test_execute_tool_returns_safe_file_error(tmp_path):
 
     assert json.loads(output) == {
         "ok": False,
-        "error": "File path must stay inside the repository",
+        "error": "Path must stay inside the repository",
     }
 
 
@@ -52,7 +74,14 @@ def test_read_file_returns_repository_file(tmp_path):
     source = repository / "example.py"
     source.write_text("print('hello')\n", encoding="utf-8")
 
-    assert read_file("example.py", repository) == "print('hello')\n"
+    assert read_file("example.py", repository) == {
+        "path": "example.py",
+        "start_line": 1,
+        "end_line": 1,
+        "total_lines": 1,
+        "content": "print('hello')\n",
+        "truncated": False,
+    }
 
 
 def test_read_file_rejects_path_outside_repository(tmp_path):
@@ -73,3 +102,88 @@ def test_read_file_rejects_large_file(tmp_path):
 
     with pytest.raises(ValueError, match="character limit"):
         read_file("large.py", repository, max_chars=10)
+
+
+def test_execute_tool_large_file_returns_window_hint(tmp_path):
+    source = tmp_path / "large.py"
+    source.write_text("line\n" * 3000, encoding="utf-8")
+
+    output = json.loads(execute_tool("read_file", '{"path":"large.py"}', tmp_path))
+
+    assert output["ok"] is False
+    assert output["total_lines"] == 3000
+    assert output["hint"] == "Call read_file again with line and context_lines."
+
+
+def test_read_file_returns_window_around_line(tmp_path):
+    source = tmp_path / "large.py"
+    source.write_text("".join(f"line {number}\n" for number in range(1, 301)))
+
+    result = read_file("large.py", tmp_path, line=150, context_lines=2)
+
+    assert result["start_line"] == 148
+    assert result["end_line"] == 152
+    assert result["total_lines"] == 300
+    assert result["content"] == (
+        "line 148\nline 149\nline 150\nline 151\nline 152\n"
+    )
+    assert result["truncated"] is True
+
+
+def test_read_file_context_lines_requires_line(tmp_path):
+    (tmp_path / "example.py").write_text("value = 1\n")
+
+    with pytest.raises(ValueError, match="requires line"):
+        read_file("example.py", tmp_path, context_lines=10)
+
+
+def test_search_code_returns_bounded_repository_matches(tmp_path):
+    (tmp_path / "first.py").write_text("class SpansBuffer:\n    pass\n")
+    (tmp_path / "second.py").write_text("buffer = SpansBuffer()\n")
+
+    result = search_code("SpansBuffer", tmp_path, max_matches=1)
+
+    assert len(result["matches"]) == 1
+    assert result["matches"][0]["path"].endswith(("first.py", "second.py"))
+    assert result["matches"][0]["line"] == 1
+    assert "SpansBuffer" in result["matches"][0]["content"]
+    assert result["truncated"] is True
+
+
+def test_search_code_falls_back_when_ripgrep_is_unavailable(tmp_path, monkeypatch):
+    (tmp_path / "first.py").write_text(
+        "class SpansBuffer:\n    pass\n", encoding="utf-8"
+    )
+
+    def missing_ripgrep(*args, **kwargs):
+        raise FileNotFoundError
+
+    monkeypatch.setattr("src.tools.subprocess.Popen", missing_ripgrep)
+
+    result = search_code("SpansBuffer", tmp_path)
+
+    assert result == {
+        "query": "SpansBuffer",
+        "path": None,
+        "matches": [
+            {
+                "path": "first.py",
+                "line": 1,
+                "content": "class SpansBuffer:",
+            }
+        ],
+        "truncated": False,
+    }
+
+
+def test_execute_search_code_rejects_path_outside_repository(tmp_path):
+    output = execute_tool(
+        "search_code",
+        '{"query":"secret","path":"../outside"}',
+        tmp_path,
+    )
+
+    assert json.loads(output) == {
+        "ok": False,
+        "error": "Path must stay inside the repository",
+    }
