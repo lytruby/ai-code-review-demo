@@ -127,15 +127,23 @@ Eval runner 会：
 三个阶段的状态由 Python 维护，而不是依赖模型记忆：
 
 ```text
-DISCOVER atomic candidates with diff evidence
-→ ACQUIRE_CONTEXT for required_facts
-→ VERIFY keep / revise / drop
+DISCOVER_CORRECTNESS runtime/API candidates (max 3)
+＋ DISCOVER_STATE state/lifecycle/concurrency candidates (max 3)
+＋ DISCOVER_CONSISTENCY behavioral-contract candidates (max 3)
+＋ DISCOVER_TESTS concrete test defects (max 3)
+→ exact deduplication
+→ semantic grouping and evidence/fact merge
+→ truncate after deduplication (max 8)
+→ ACQUIRE_CONTEXT resolve required_facts within a budget
+→ VERIFY keep / revise / rejected
+→ unresolved facts become inconclusive
 → FINALIZE summary
 → COMPLETE
 ```
 
 最终阶段不能新增或改写 issues；正式 issues 只来自 VERIFY 的结构化结果。
-每个 candidate 只能描述一个 claim，并携带结构化 evidence 引用。每条引用使用 `side: before | after` 标明变更侧，并包含一个连续源码片段；非连续位置或 before/after transition 必须拆成多条引用。代码会分别重建变更前后的源码，验证每条 evidence 的 side、内容和文件归属。
+DISCOVER 由四个独立模型调用组成。Correctness pass 检查类型/API、空值、控制流和边界条件；state pass 检查状态转换、生命周期、事务与并发；consistency pass 检查公开命名、用户文案、默认值、序列化与跨文件行为契约；tests pass 只检查会造成假通过或不稳定失败的 mock、sleep、assertion 和 setup/cleanup。代码先按四个 pass 的证据强度顺序交错收集全部候选并做精确 claim 去重，再进入独立 DEDUPLICATE 阶段。只有 root cause、主要 observable impact 和 remediation 都相同，最终 review comment 可以互换的 candidates 才能合并；同一调用链中的上游原因和下游影响保持独立。代码校验分组必须完整、不重叠且 representative 属于组内；重复组保留最清晰的 representative claim，并合并各候选的 evidence 与最多 2 条 required facts。每组还必须给出 1–5 priority，代码按“priority 降序、原始位置升序”稳定排序后再截断到最多 8 条。模型输出无效时重试，预算耗尽则安全回退到精确去重结果，并在 trajectory 中记录 fallback。
+每个 candidate 只能描述一个 claim，并携带结构化 evidence 引用。每条引用使用 `file` 声明证据所在的 diff 文件，使用 `side: before | after` 标明变更侧，并包含一个连续源码片段；跨文件因果链拆成多条带各自 `file` 的 evidence。Candidate 顶层 `file` 表示最终评论位置，并且必须至少出现在一条 evidence 中。非连续位置或 before/after transition 也必须拆成多条引用。代码会分别重建各文件变更前后的源码，验证每条 evidence 的 side、内容和文件归属。旧轨迹中缺少 `evidence.file` 的引用仍兼容为 candidate 顶层文件。
 
 DISCOVER 还必须列出验证该 claim 所需、但 diff 中不可见的 repository facts：
 
@@ -152,7 +160,7 @@ DISCOVER 还必须列出验证该 claim 所需、但 diff 中不可见的 reposi
 }
 ```
 
-每条 candidate 最多 2 个 required facts。每个 fact 使用结构化 locator：`path + query` 会在指定路径内搜索并读取首个匹配位置，只有 `path` 时直接读取文件，只有 `query` 时执行全仓库搜索并读取首个匹配位置。Required facts 非空时，VERIFY 必须使用 repository basis；空列表时必须使用 diff basis。
+每条 candidate 最多 2 个 required facts。每个 fact 使用结构化 locator：`path + query` 会在指定路径内搜索并读取首个匹配位置，只有 `path` 时直接读取文件，只有 `query` 时执行全仓库搜索并读取首个匹配位置。一次成功的搜索不等于 fact 已解决；只有成功读取相关源码才算 resolved。初始定位失败时，ACQUIRE_CONTEXT 允许模型在每条 fact 的独立预算内调整查询或读取位置。预算耗尽仍未读取到源码时，该 candidate 记为 `inconclusive`，不会进入 VERIFY。Required facts 非空时，VERIFY 必须使用 repository basis；空列表时必须使用 diff basis。
 
 Repository 工具分工：
 
@@ -171,7 +179,9 @@ VERIFY 的每条 decision 必须声明判断依据：
 {"basis": "diff | repository"}
 ```
 
-`basis=repository` 必须在该 candidate 的独立轨迹中至少有一次成功的 `search_code` 或 `read_file`，否则 workflow 会拒绝 verdict 并要求重试。`basis=diff` 表示只能依据 supplied diff，不应声称仓库中的定义、调用点、继承或运行时状态。
+VERIFY 的否定结论记为 `rejected`，表示已有证据证明 candidate 不成立；`inconclusive` 由 workflow 生成，表示 required facts 在预算内没有查清。这两个结果都不会成为最终 issue，但会在 trajectory 中分开记录，便于区分验证判断问题与 retrieval/budget 问题。`basis=repository` 只会在 required facts 全部 resolved 后进入 VERIFY；`basis=diff` 表示只能依据 supplied diff，不应声称仓库中的定义、调用点、继承或运行时状态。
+
+`keep` 和 `revise` 还必须返回结构化 `supporting_evidence`。Diff evidence 会再次按 `file + side + text` 校验；repository evidence 的文件和原文必须真实出现在该 candidate 成功的 `read_file` 结果中。模型不能仅凭一次搜索、一次无关文件读取，或自身常识把新的 repository fact 写进最终 issue。Supporting evidence 会保留在 candidate trajectory 中，供人工检查最终描述中的每项行为断言是否都有证据。
 
 如果评审失败，同一目录下会保存 `error.json`，其中包含错误信息和失败前的可观察轨迹。
 

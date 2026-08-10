@@ -1638,6 +1638,233 @@ TP + FN = total_golden
 67 tests passed
 ```
 
+## 2026-08-09：Required fact resolution gate
+
+### 目标
+
+防止一次成功但零匹配的 `search_code` 被误当成 repository fact 已解决，并避免
+unresolved fact 无限消耗工具调用。
+
+### 唯一变量 / 代码变更
+
+1. 每条 required fact 最多使用 4 次 context 工具调用、3 个恢复回合。
+2. 搜索只负责定位；只有成功的 `read_file` 才把 fact 标记为 resolved。
+3. 初始 acquisition 失败后进入独立 ACQUIRE_CONTEXT 恢复流程，由模型调整精确
+   query 或读取位置。
+4. 所有 facts resolved 后才进入 VERIFY。
+5. VERIFY 的反证结果使用 `rejected`；预算耗尽仍未查清由 workflow 记录为
+   `inconclusive`，并保存 unresolved fact indices。
+
+### 测试
+
+- 初始搜索零匹配后，模型改为直接读取文件并成功进入 VERIFY。
+- context 回合预算耗尽后生成 inconclusive，且不调用 VERIFY。
+
+```text
+69 tests passed
+```
+
+## 2026-08-09：Cross-file evidence
+
+### 目标
+
+允许一条 candidate 用多个 diff 文件组成完整因果链，例如 routes 中的 GET 路由与
+controller 中的状态修改。
+
+### 唯一变量 / 代码变更
+
+1. `EvidenceRef` 增加可序列化的 `file` 字段。
+2. DISCOVER prompt 要求每条 evidence 声明自己的文件。
+3. Validator 按每条 evidence 的 `file + side + text` 独立校验。
+4. Candidate 顶层 `file` 作为最终评论位置，必须至少出现在一条 evidence 中。
+5. 旧格式缺少 evidence file 时继续按 candidate 顶层文件读取，保证已有测试和轨迹
+   可复用。
+
+### 测试
+
+- 接受 routes + controller 的跨文件 evidence。
+- 拒绝没有任何 evidence 指向 candidate 顶层文件的输出。
+- 继续拒绝伪造文件归属的 evidence。
+
+## 2026-08-09：VERIFY supporting-evidence gate
+
+### 目标
+
+阻止 VERIFY 在 `keep/revise` 时通过无关工具调用引入未经读取的新 repository fact。
+
+### 唯一变量 / 代码变更
+
+1. `keep/revise` 必须输出结构化 `supporting_evidence`。
+2. Diff support 必须精确匹配相应文件和 before/after side。
+3. Repository support 必须是该 candidate 成功 `read_file` 返回内容中的精确片段。
+4. Repository basis 至少包含一条 repository support；diff basis 只能使用 diff support。
+5. 经过验证的 supporting evidence 写入 candidate trajectory。
+
+### 边界
+
+代码可以验证引用来源真实，但不能仅靠字符串匹配证明自然语言 description 的每个
+语义断言都被引用覆盖；prompt 同时要求模型为每个可独立检查的行为断言提供证据，
+trajectory 则保留引用供后续 judge 或人工审计。
+
+## 2026-08-09：Two-pass DISCOVER coverage
+
+### 目标
+
+用通用 review 视角提高候选覆盖率，同时避免把当前三个 benchmark 的具体 golden
+答案写入 prompt。
+
+### 唯一变量 / 代码变更
+
+1. Correctness pass：类型/签名、nil/null、控制流、边界和 API contract。
+2. State pass：状态转换、生命周期、事务、并发和 one-time-use guarantee。
+3. 每个 pass 独立调用、独立重试和 evidence validation，最多返回 3 条。
+4. Workflow 交错合并两个 pass，按 `file + normalized claim` 精确去重，最终最多
+   6 条。
+5. 单个 pass 失败时保留另一个 pass 的有效输出；两个都失败才终止 DISCOVER。
+6. Trajectory 记录每个 pass 的候选数、rejections 和 failure。
+
+### 暂不包含
+
+Naming/wording consistency 与 tests quality 尚未加入，作为后续独立变量。
+
+### 测试
+
+```text
+74 tests passed
+```
+
+## 2026-08-09：Complete four-pass DISCOVER
+
+### 目标
+
+在语义去重前补齐通用 review 覆盖面，避免后续无法判断候选缺失是 pass coverage
+还是 deduplication 导致。
+
+### 唯一变量 / 代码变更
+
+在 correctness 与 state pass 之外新增：
+
+1. Behavioral consistency：公开命名、用户文案、配置默认值、序列化/type contract、
+   normalization 与跨文件行为一致性。
+2. Tests quality：会导致假通过或不稳定失败的 mock/monkeypatch、固定 sleep、无效
+   assertion 和 setup/cleanup 状态泄漏。
+
+四个 pass 各最多返回 3 条；workflow 交错合并并执行精确 claim 去重，最终最多
+保留 8 条，确保后加入的 pass 也获得候选预算。语义去重暂不加入，作为下一步独立
+变量。
+
+## 2026-08-09：Semantic deduplication before truncation
+
+### 目标
+
+避免四个 pass 的语义重复候选占用 VERIFY 名额，同时避免在去重前截断导致后排的
+独立问题丢失。
+
+### 唯一变量 / 代码变更
+
+1. 四个 pass 先交错收集全部候选（最多 12），不再提前截断。
+2. 精确 claim 去重后进入独立 DEDUPLICATE 模型阶段。
+3. 模型只判断是否属于相同 defect/failure path，不判断候选正确性；不确定时保持
+   singleton。
+4. 框架验证 groups 是所有 candidate indices 的完整、不重叠 partition，且
+   representative 位于组内。
+5. 重复组使用 representative claim/severity/file，并合并去重后的 evidence 与最多
+   2 条 required facts。
+6. 语义去重后才按原始交错优先级截断到 8 条。
+7. DEDUPLICATE 两轮仍无效时回退到精确去重结果并记录 trajectory，不让 review
+   整体失败。
+
+### 测试
+
+- 相同竞态的两个不同表述合并为一个 candidate。
+- Evidence 与 required facts 被保留合并。
+- 缺失 candidate index 的非完整 partition 被拒绝。
+
+```text
+76 tests passed
+```
+
+## 2026-08-09：Strict deduplication and post-dedup ranking
+
+### 目标
+
+修复 semantic-dedup-v1 中 Grafana 上游原因/下游影响被过度合并，以及 Sentry
+具体 metric candidate 因原始位置靠后被直接截断的问题。
+
+### 唯一变量 / 代码变更
+
+1. Duplicate 必须同时满足相同 root cause、相同主要 observable impact、基本相同
+   remediation，且两条最终 review comment 可以互换。
+2. 同一 feature/call chain/causal chain 不再足以合并；独立可行动的上游原因和下游
+   影响保持 singleton。
+3. 每个 dedup group 必须输出 1–5 priority。
+4. Priority 强调 changed code、直接 failure、证据强度和 actionable impact；具体的
+   low-severity 问题不会仅因 severity 低而降权。
+5. 代码验证 priority 类型/范围，按 priority 降序及最早 candidate index 升序稳定
+   排序，然后才截断到 8 条。
+
+### 测试
+
+- 高 priority singleton 会排在更早但低 priority 的候选之前。
+- 缺少 priority 的分组输出被拒绝。
+
+```text
+78 tests passed
+```
+
+## 2026-08-09：Bounded VERIFY finalization turn
+
+### 目标
+
+修复模型在最后一个 VERIFY 探索轮才完成工具调用，或最终 decision 因 evidence
+格式校验失败后，没有机会根据反馈收口的问题。
+
+### 唯一变量 / 代码变更
+
+1. 保留每个 candidate 的 4 个 VERIFY 探索轮，不提高工具探索预算。
+2. 探索预算结束后增加 1 个无工具的 finalization turn。
+3. 收口轮明确要求仅使用已有证据；diff 已足够时使用 `basis=diff`，否则返回
+   `rejected` 或 `inconclusive`。
+4. 全局模型轮数预算同步计入每个 candidate 的一次收口机会。
+
+### 原因
+
+`dedup-ranking-v1/grafana-79265` 的 candidate 4 在前三轮执行 `search_code`，
+第四轮已返回完整 decision，但 repository evidence 未满足逐字引用约束。框架给出
+校验反馈后立即耗尽轮数，导致整个 case 失败。
+
+## 2026-08-09：Core-defect-preserving VERIFY
+
+### 目标
+
+修复 candidate 的核心缺陷成立，但影响范围或附加描述过度时，VERIFY 将整条
+candidate 错误 `rejected` 而造成漏报的问题。
+
+### 唯一变量 / Prompt 变更
+
+1. VERIFY 先判断最小、具体的核心 failure path，再单独判断范围、严重性、受影响
+   对象、次要影响和 remediation。
+2. 核心成立而附加描述不成立时必须 `revise`，删除或收窄过度描述。
+3. 只有核心缺陷或因果链被反证，或修正后不再剩下 actionable defect，才能
+   `rejected`。
+4. “看起来是预期行为”不构成反证；只有 diff、测试、文档或已读取的仓库代码能够
+   证明 intended contract。
+
+### 观察来源
+
+`verify-finalization-v1/grafana-79265` 已在 DISCOVER 找到“达到设备上限会让匿名
+认证失败”，但候选同时夸大为影响所有匿名用户。VERIFY 应将其收窄为新设备达到
+上限后认证失败并返回 `revise`，而不是拒绝整个核心问题。
+
+### 测试
+
+VERIFY prompt 回归断言覆盖核心缺陷拆分、`revise` 优先和 intended behavior 证据
+要求。
+
+```text
+79 tests passed
+```
+
 ## 后续记录模板
 
 ```markdown

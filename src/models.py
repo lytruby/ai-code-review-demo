@@ -19,6 +19,7 @@ class ReviewIssue:
 class EvidenceRef:
     side: EvidenceSide
     text: str
+    file: str | None = None
 
 
 @dataclass

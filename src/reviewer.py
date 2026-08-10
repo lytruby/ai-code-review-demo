@@ -26,13 +26,24 @@ from src.tools import READ_FILE_TOOL, SEARCH_CODE_TOOL, execute_tool
 
 MAX_TOOL_CALLS = 40
 MAX_REQUIRED_FACTS_PER_CANDIDATE = 2
-MAX_CANDIDATES = 5
+MAX_CANDIDATES_PER_DISCOVERY_PASS = 3
+MAX_CANDIDATES = 8
 MAX_DISCOVER_TURNS = 2
+MAX_DEDUPLICATE_TURNS = 2
+MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
+MAX_CONTEXT_TURNS_PER_FACT = 3
 MAX_VERIFY_TURNS_PER_CANDIDATE = 4
+MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE = 1
 MAX_FINALIZE_TURNS = 2
 MAX_MODEL_TURNS = (
-    MAX_DISCOVER_TURNS
-    + MAX_CANDIDATES * MAX_VERIFY_TURNS_PER_CANDIDATE
+    4 * MAX_DISCOVER_TURNS
+    + MAX_DEDUPLICATE_TURNS
+    + MAX_CANDIDATES * MAX_REQUIRED_FACTS_PER_CANDIDATE * MAX_CONTEXT_TURNS_PER_FACT
+    + MAX_CANDIDATES
+    * (
+        MAX_VERIFY_TURNS_PER_CANDIDATE
+        + MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE
+    )
     + MAX_FINALIZE_TURNS
 )
 TRANSIENT_API_ERRORS = (
@@ -63,7 +74,7 @@ Find plausible candidate issues in the supplied pull request changes. This is
 an internal discovery step, not the final review. Do not call tools in this
 stage.
 
-Return at most 5 candidates, ordered by evidence strength.
+Return at most 3 candidates, ordered by evidence strength.
 
 Prefer candidates that:
 - point to a concrete changed line or code path,
@@ -86,6 +97,7 @@ Return only valid JSON with this structure:
       "claim": "One suspected defect and its direct impact",
       "evidence": [
         {
+          "file": "path/to/file.py",
           "side": "before | after",
           "text": "A non-empty consecutive source excerpt from that side"
         }
@@ -104,10 +116,14 @@ Return only valid JSON with this structure:
 
 Each candidate must contain exactly one underlying claim. Do not combine
 multiple defects, alternatives, or future concerns. Do not write a suggestion
-yet. Evidence must be a non-empty list. Use side=before for removed/context
-code and side=after for added/context code. Each text must copy consecutive
-source lines from that side of the declared file. Use multiple references for
-non-contiguous evidence or a before/after transition. Never use ellipses.
+yet. Evidence must be a non-empty list. Every evidence reference must declare
+its own file. Use side=before for removed/context code and side=after for
+added/context code. Each text must copy consecutive source lines from that
+side of its evidence file. Cross-file claims must use separate evidence
+references for each file. The candidate's top-level file is where the final
+review comment belongs and must appear in at least one evidence reference.
+Use multiple references for non-contiguous evidence or a before/after
+transition. Never use ellipses.
 Omit unified-diff markers (+, -, or space); indentation need not match.
 List every fact that is not visible in the diff in required_facts, with at most
 two concise repository facts per candidate. Use an empty list only when the
@@ -116,6 +132,90 @@ Each required fact must provide path, query, or both. Use path+query when the
 likely file is known, path only to read a known file, and query only for a
 repository-wide search. Query must be exact source text or a symbol, never a
 natural-language search request.
+"""
+
+DISCOVERY_PASSES = (
+    (
+        "correctness",
+        """\
+Focus only on runtime correctness and API contracts: type/signature errors,
+nil/null handling, incorrect control flow, boundary conditions, invalid API
+usage, and behavior that cannot work as written. Follow data and control flow
+across changed files when needed. Do not spend candidate slots on concurrency,
+lifecycle, style, naming, wording, or test-quality concerns in this pass.
+""",
+    ),
+    (
+        "state_and_concurrency",
+        """\
+Focus only on state, lifecycle, and concurrency: non-atomic read-modify-write,
+races, transaction boundaries, one-time-use guarantees, process/thread/task
+lifecycle, cleanup and deadline behavior, and inconsistent state transitions.
+Require a concrete interleaving or lifecycle path. Do not return generic
+thread-safety speculation, style, naming, wording, or test-quality concerns.
+        """,
+    ),
+    (
+        "behavioral_consistency",
+        """\
+Focus only on behavioral consistency across the changed system: public names
+and exported symbols, user-facing messages versus the action being performed,
+configuration defaults, serialization/type contracts, normalization rules,
+and before/after or cross-file behavior that disagrees. Require a concrete
+confusing or incorrect outcome, not a style preference. Do not return generic
+runtime, concurrency, lifecycle, or test-quality concerns in this pass.
+""",
+    ),
+    (
+        "tests_quality",
+        """\
+Focus only on concrete defects in changed tests: mocks or monkeypatches that
+invalidate the behavior under test, fixed sleeps and timing races, assertions
+that cannot detect the regression, and setup/cleanup that leaks state between
+tests. Explain how the test can pass incorrectly or fail nondeterministically.
+Do not request broader test coverage or return production-code design/style
+concerns in this pass.
+""",
+    ),
+)
+
+DEDUPLICATE_PROMPT = """\
+Stage: DEDUPLICATE
+
+Group candidates only when they have the same root cause, the same primary
+observable impact, and substantially the same remediation, such that either
+candidate could replace the other as the final review comment. Sharing a file,
+feature, call chain, or causal relationship is not enough. Keep upstream cause
+and downstream consequence separate when each is independently actionable.
+If two candidates could both be true independently or you are uncertain, keep
+them in separate singleton groups. Do not judge whether a candidate is correct;
+VERIFY handles that.
+
+Return a complete partition of all candidate indices. Every input index must
+appear exactly once. representative_index must be a member of its group and
+should select the clearest, most concrete claim. Assign priority from 1 to 5
+for selection after deduplication: favor concrete changed code, direct runtime
+or behavioral failure, strong supplied evidence, and actionable impact; lower
+unsupported, conditional, stylistic, or future-maintenance concerns. Do not
+lower priority merely because an issue is low severity when it is concrete.
+
+Return only valid JSON:
+{
+  "groups": [
+    {
+      "candidate_indices": [0, 2],
+      "representative_index": 0,
+      "priority": 5,
+      "reason": "Both describe the same failure path"
+    },
+    {
+      "candidate_indices": [1],
+      "representative_index": 1,
+      "priority": 3,
+      "reason": "Distinct defect"
+    }
+  ]
+}
 """
 
 VERIFY_PROMPT = """\
@@ -131,8 +231,23 @@ Invoke tools through actual function tool calls. Never return tool arguments
 such as {"query": ...} or {"path": ...} as ordinary JSON content.
 - keep: the candidate is supported as written;
 - revise: there is a real issue, but its description or suggestion needs repair;
-- drop: the candidate is contradicted, speculative, non-actionable, or only a
+- rejected: the candidate is contradicted, speculative, non-actionable, or only a
   future maintenance concern.
+
+Judge the candidate's smallest concrete defect separately from any overstated
+scope, severity, affected population, secondary impact, or suggested fix. If
+the core failure path remains supported but one of those details is inaccurate,
+return revise and remove or narrow the unsupported detail. Do not reject the
+whole candidate merely because it says "all" where only some requests fail,
+combines one supported impact with one unsupported impact, or proposes the
+wrong remediation. Use rejected only when the core defect or causal chain is
+itself disproved or no concrete actionable defect remains after correction.
+
+Do not treat a behavior as correct merely because it appears intentional or
+could be a product choice. Intent is evidence only when the supplied diff,
+tests, documentation, or successfully read repository context establishes the
+intended contract. Without such evidence, judge the observable behavior and
+revise an overstated candidate to the narrowest supported defect.
 
 Do not create a new candidate. When verification is complete, return only
 valid JSON with exactly one decision whose candidate_index is 0:
@@ -140,9 +255,17 @@ valid JSON with exactly one decision whose candidate_index is 0:
   "decisions": [
     {
       "candidate_index": 0,
-      "verdict": "keep | revise | drop",
+      "verdict": "keep | revise | rejected",
       "basis": "diff | repository",
       "reason": "Why this verdict is supported",
+      "supporting_evidence": [
+        {
+          "source": "diff | repository",
+          "file": "path/to/file.py",
+          "side": "before | after (diff only)",
+          "text": "Exact consecutive source excerpt"
+        }
+      ],
       "issue": {
         "file": "path/to/file.py",
         "severity": "low | medium | high",
@@ -153,12 +276,27 @@ valid JSON with exactly one decision whose candidate_index is 0:
   ]
 }
 
-For drop decisions, issue must be null. For keep and revise decisions, issue
-must contain the verified issue. Use basis=diff only when the claim can be
+For rejected decisions, issue must be null. For keep and revise decisions, issue
+must contain the verified issue and supporting_evidence must contain exact
+source excerpts supporting every independently checkable behavioral assertion
+in the final description. Do not introduce a new repository fact in a revised
+issue unless its exact supporting source has been read. Diff evidence must
+declare side; repository evidence must come from a successful read_file result.
+Use basis=diff only when the claim can be
 decided entirely from the supplied diff. A diff-based reason must not assert
 facts about definitions, call sites, inheritance, configuration, or runtime
 state outside the diff. Use basis=repository when repository context is needed;
 you must successfully call search_code or read_file before returning it.
+"""
+
+ACQUIRE_CONTEXT_PROMPT = """\
+Stage: ACQUIRE_CONTEXT
+
+Resolve one required repository fact. Use actual search_code and read_file tool
+calls; do not judge the candidate or return a verification decision. Search
+results alone do not resolve a fact: read the relevant source. If an exact
+search has no matches, try a better exact symbol/text query or read a known
+file around the relevant location. The workflow enforces a finite tool budget.
 """
 
 FINALIZE_PROMPT = """\
@@ -175,7 +313,14 @@ Return only valid JSON:
 """
 
 
-ReviewStage = Literal["discover", "verify", "finalize", "complete"]
+ReviewStage = Literal[
+    "discover",
+    "deduplicate",
+    "acquire_context",
+    "verify",
+    "finalize",
+    "complete",
+]
 
 
 @dataclass
@@ -265,11 +410,196 @@ class OpenAIReviewer(Reviewer):
         )
 
     def _discover(self, code_changes: str, state: ReviewState) -> list[CandidateIssue]:
+        pass_candidates = []
+        pass_rejection_counts = []
+        successful_passes = 0
+
+        for pass_name, focus_prompt in DISCOVERY_PASSES:
+            try:
+                candidates, rejection_count = self._discover_pass(
+                    code_changes, state, pass_name, focus_prompt
+                )
+            except ValueError as error:
+                state.trace.append(
+                    {
+                        "type": "discovery_pass_failure",
+                        "stage": "discover",
+                        "pass": pass_name,
+                        "error": str(error),
+                    }
+                )
+                pass_candidates.append([])
+                pass_rejection_counts.append(0)
+                continue
+            successful_passes += 1
+            pass_candidates.append(candidates)
+            pass_rejection_counts.append(rejection_count)
+
+        if successful_passes == 0:
+            raise ValueError("DISCOVER did not return valid candidates")
+
+        merged = []
+        seen = set()
+        for candidate_offset in range(MAX_CANDIDATES_PER_DISCOVERY_PASS):
+            for candidates in pass_candidates:
+                if candidate_offset >= len(candidates):
+                    continue
+                candidate = candidates[candidate_offset]
+                key = (candidate.file, " ".join(candidate.claim.lower().split()))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(candidate)
+
+        before_semantic_dedup = len(merged)
+        state.stage = "deduplicate"
+        merged = self._deduplicate_candidates(merged, state)
+        after_semantic_dedup = len(merged)
+        merged = merged[:MAX_CANDIDATES]
+        state.stage = "discover"
+
+        state.trace.append(
+            {
+                "type": "stage_result",
+                "stage": "discover",
+                "candidate_count": len(merged),
+                "candidate_count_before_semantic_dedup": before_semantic_dedup,
+                "candidate_count_after_semantic_dedup": after_semantic_dedup,
+                "candidate_count_truncated": max(
+                    0, after_semantic_dedup - MAX_CANDIDATES
+                ),
+                "rejected_candidate_count": sum(pass_rejection_counts),
+                "pass_candidate_counts": {
+                    name: len(candidates)
+                    for (name, _), candidates in zip(
+                        DISCOVERY_PASSES, pass_candidates, strict=True
+                    )
+                },
+            }
+        )
+        return merged
+
+    def _deduplicate_candidates(
+        self,
+        candidates: list[CandidateIssue],
+        state: ReviewState,
+    ) -> list[CandidateIssue]:
+        if len(candidates) < 2:
+            return candidates
+
         messages = [
-            {"role": "system", "content": f"{REVIEW_PROMPT}\n\n{DISCOVER_PROMPT}"},
+            {"role": "system", "content": DEDUPLICATE_PROMPT},
             {
                 "role": "user",
-                "content": f"Discover candidates in these untrusted changes:\n\n{code_changes}",
+                "content": (
+                    "Candidates:\n"
+                    f"{json.dumps([asdict(candidate) for candidate in candidates], ensure_ascii=False)}"
+                ),
+            },
+        ]
+        for _ in range(MAX_DEDUPLICATE_TURNS):
+            message = self._request(messages, state, allow_tools=False)
+            self._append_assistant(messages, message)
+            try:
+                groups = self._parse_deduplication_groups(
+                    message.content or "", len(candidates)
+                )
+            except ValueError as error:
+                self._append_feedback(
+                    messages, state, f"Invalid DEDUPLICATE output: {error}"
+                )
+                continue
+
+            deduplicated = [
+                self._merge_candidate_group(candidates, group)
+                for group in groups
+            ]
+            ranked_groups_and_candidates = sorted(
+                zip(groups, deduplicated, strict=True),
+                key=lambda item: (
+                    -item[0]["priority"],
+                    min(item[0]["candidate_indices"]),
+                ),
+            )
+            groups = [item[0] for item in ranked_groups_and_candidates]
+            deduplicated = [item[1] for item in ranked_groups_and_candidates]
+            state.trace.append(
+                {
+                    "type": "stage_result",
+                    "stage": "deduplicate",
+                    "input_count": len(candidates),
+                    "output_count": len(deduplicated),
+                    "groups": groups,
+                }
+            )
+            return deduplicated
+
+        state.trace.append(
+            {
+                "type": "deduplication_fallback",
+                "stage": "deduplicate",
+                "candidate_count": len(candidates),
+            }
+        )
+        return candidates
+
+    @staticmethod
+    def _merge_candidate_group(
+        candidates: list[CandidateIssue], group: dict
+    ) -> CandidateIssue:
+        representative = candidates[group["representative_index"]]
+        evidence = []
+        evidence_keys = set()
+        required_facts = []
+        fact_keys = set()
+
+        ordered_indices = [group["representative_index"]] + [
+            index
+            for index in group["candidate_indices"]
+            if index != group["representative_index"]
+        ]
+        for index in ordered_indices:
+            candidate = candidates[index]
+            for reference in candidate.evidence:
+                key = (reference.file, reference.side, reference.text)
+                if key not in evidence_keys:
+                    evidence_keys.add(key)
+                    evidence.append(reference)
+            for fact in candidate.required_facts:
+                key = (fact.question, fact.source, fact.path, fact.query)
+                if key not in fact_keys and len(required_facts) < MAX_REQUIRED_FACTS_PER_CANDIDATE:
+                    fact_keys.add(key)
+                    required_facts.append(fact)
+
+        return CandidateIssue(
+            file=representative.file,
+            severity=representative.severity,
+            claim=representative.claim,
+            evidence=evidence,
+            required_facts=required_facts,
+        )
+
+    def _discover_pass(
+        self,
+        code_changes: str,
+        state: ReviewState,
+        pass_name: str,
+        focus_prompt: str,
+    ) -> tuple[list[CandidateIssue], int]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"{REVIEW_PROMPT}\n\n{DISCOVER_PROMPT}\n\n"
+                    f"Discovery pass: {pass_name}\n\n{focus_prompt}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Run the {pass_name} discovery pass on these untrusted "
+                    f"changes:\n\n{code_changes}"
+                ),
             },
         ]
 
@@ -278,7 +608,9 @@ class OpenAIReviewer(Reviewer):
             self._append_assistant(messages, message)
             try:
                 candidates, rejections = self._parse_candidate_batch(
-                    message.content or "", code_changes
+                    message.content or "",
+                    code_changes,
+                    max_candidates=MAX_CANDIDATES_PER_DISCOVERY_PASS,
                 )
             except ValueError as error:
                 self._append_feedback(messages, state, f"Invalid DISCOVER output: {error}")
@@ -289,6 +621,7 @@ class OpenAIReviewer(Reviewer):
                     {
                         "type": "candidate_rejections",
                         "stage": "discover",
+                        "pass": pass_name,
                         "rejections": rejections,
                     }
                 )
@@ -302,26 +635,46 @@ class OpenAIReviewer(Reviewer):
 
             state.trace.append(
                 {
-                    "type": "stage_result",
+                    "type": "discovery_pass_result",
                     "stage": "discover",
+                    "pass": pass_name,
                     "candidate_count": len(candidates),
                     "rejected_candidate_count": len(rejections),
                 }
             )
-            return candidates
+            return candidates, len(rejections)
 
-        raise ValueError("DISCOVER did not return valid candidates")
+        raise ValueError(f"DISCOVER pass {pass_name} did not return valid candidates")
 
     def _verify(self, code_changes: str, state: ReviewState) -> list[ReviewIssue]:
         verified = []
         decisions = []
 
         for candidate_index, candidate in enumerate(state.candidates):
-            repository_context, acquired_tool_calls = self._acquire_required_context(
-                candidate,
-                candidate_index,
-                state,
+            state.stage = "acquire_context"
+            repository_context, acquired_tool_calls, unresolved_facts = (
+                self._acquire_required_context(candidate, candidate_index, state)
             )
+            if unresolved_facts:
+                decision = {
+                    "candidate_index": candidate_index,
+                    "verdict": "inconclusive",
+                    "basis": "repository",
+                    "reason": "Required repository facts were not resolved within the context budget",
+                    "unresolved_fact_indices": unresolved_facts,
+                }
+                state.trace.append(
+                    {
+                        "type": "candidate_result",
+                        "stage": "acquire_context",
+                        **decision,
+                        "successful_tool_calls": acquired_tool_calls,
+                    }
+                )
+                decisions.append(decision)
+                continue
+
+            state.stage = "verify"
             candidate_issues, candidate_decision = self._verify_candidate(
                 code_changes,
                 candidate,
@@ -338,6 +691,14 @@ class OpenAIReviewer(Reviewer):
                 "type": "stage_result",
                 "stage": "verify",
                 "kept_count": len(verified),
+                "rejected_count": sum(
+                    decision["verdict"] in {"rejected", "drop"}
+                    for decision in decisions
+                ),
+                "inconclusive_count": sum(
+                    decision["verdict"] == "inconclusive"
+                    for decision in decisions
+                ),
                 "decisions": decisions,
             }
         )
@@ -369,8 +730,29 @@ class OpenAIReviewer(Reviewer):
             },
         ]
 
-        for _ in range(MAX_VERIFY_TURNS_PER_CANDIDATE):
-            message = self._request(messages, state, allow_tools=True)
+        total_verify_turns = (
+            MAX_VERIFY_TURNS_PER_CANDIDATE
+            + MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE
+        )
+        for turn_index in range(total_verify_turns):
+            is_finalization_turn = turn_index >= MAX_VERIFY_TURNS_PER_CANDIDATE
+            if is_finalization_turn:
+                self._append_feedback(
+                    messages,
+                    state,
+                    "Verification tool and exploration budget is exhausted. "
+                    "Return the final decision now using only evidence already "
+                    "available. Do not request another tool. If the diff alone "
+                    "supports the issue, use basis=diff and include only diff "
+                    "supporting_evidence. If the claim is not established, "
+                    "return rejected or inconclusive.",
+                )
+
+            message = self._request(
+                messages,
+                state,
+                allow_tools=not is_finalization_turn,
+            )
             tool_calls = message.tool_calls or []
             self._append_assistant(messages, message)
 
@@ -389,6 +771,11 @@ class OpenAIReviewer(Reviewer):
                     [candidate],
                     repository_context_available=successful_tool_calls > 0,
                     expected_basis=expected_basis,
+                    code_changes=code_changes,
+                    repository_sources=self._repository_sources_for_candidate(
+                        repository_context, state, candidate_index
+                    ),
+                    require_supporting_evidence=True,
                 )
             except ValueError as error:
                 feedback = f"Invalid VERIFY output: {error}"
@@ -422,12 +809,19 @@ class OpenAIReviewer(Reviewer):
         candidate: CandidateIssue,
         candidate_index: int,
         state: ReviewState,
-    ) -> tuple[list[dict], int]:
+    ) -> tuple[list[dict], int, list[int]]:
         acquired_context = []
         successful_tool_calls = 0
+        unresolved_facts = []
 
         for fact_index, fact in enumerate(candidate.required_facts):
-            fact_context = {"required_fact": asdict(fact), "search": None, "read": None}
+            fact_context = {
+                "required_fact": asdict(fact),
+                "search": None,
+                "read": None,
+                "resolved": False,
+                "tool_calls": 0,
+            }
             if fact.path is not None and fact.query is None:
                 read_output, read_succeeded = self._execute_workflow_tool(
                     tool_name="read_file",
@@ -440,49 +834,124 @@ class OpenAIReviewer(Reviewer):
                     state=state,
                 )
                 fact_context["read"] = json.loads(read_output)
+                fact_context["tool_calls"] += 1
                 successful_tool_calls += int(read_succeeded)
-                acquired_context.append(fact_context)
-                continue
-
-            search_arguments = {"query": fact.query}
-            if fact.path is not None:
-                search_arguments["path"] = fact.path
-            search_output, search_succeeded = self._execute_workflow_tool(
-                tool_name="search_code",
-                arguments=json.dumps(
-                    search_arguments,
-                    ensure_ascii=False,
-                ),
-                candidate_index=candidate_index,
-                fact_index=fact_index,
-                state=state,
-            )
-            fact_context["search"] = json.loads(search_output)
-            successful_tool_calls += int(search_succeeded)
-
-            matches = fact_context["search"].get("matches", [])
-            if search_succeeded and matches and state.tool_calls < MAX_TOOL_CALLS:
-                first_match = matches[0]
-                read_output, read_succeeded = self._execute_workflow_tool(
-                    tool_name="read_file",
-                    arguments=json.dumps(
-                        {
-                            "path": first_match["path"],
-                            "line": first_match["line"],
-                            "context_lines": 50,
-                        },
-                        ensure_ascii=False,
-                    ),
+                fact_context["resolved"] = read_succeeded
+            else:
+                search_arguments = {"query": fact.query}
+                if fact.path is not None:
+                    search_arguments["path"] = fact.path
+                search_output, search_succeeded = self._execute_workflow_tool(
+                    tool_name="search_code",
+                    arguments=json.dumps(search_arguments, ensure_ascii=False),
                     candidate_index=candidate_index,
                     fact_index=fact_index,
                     state=state,
                 )
-                fact_context["read"] = json.loads(read_output)
-                successful_tool_calls += int(read_succeeded)
+                fact_context["search"] = json.loads(search_output)
+                fact_context["tool_calls"] += 1
+                successful_tool_calls += int(search_succeeded)
+
+                matches = fact_context["search"].get("matches", [])
+                if search_succeeded and matches and state.tool_calls < MAX_TOOL_CALLS:
+                    first_match = matches[0]
+                    read_output, read_succeeded = self._execute_workflow_tool(
+                        tool_name="read_file",
+                        arguments=json.dumps(
+                            {
+                                "path": first_match["path"],
+                                "line": first_match["line"],
+                                "context_lines": 50,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        candidate_index=candidate_index,
+                        fact_index=fact_index,
+                        state=state,
+                    )
+                    fact_context["read"] = json.loads(read_output)
+                    fact_context["tool_calls"] += 1
+                    successful_tool_calls += int(read_succeeded)
+                    fact_context["resolved"] = read_succeeded
+
+            if not fact_context["resolved"]:
+                successful_tool_calls += self._recover_required_fact(
+                    candidate, fact, candidate_index, fact_index, fact_context, state
+                )
+            if not fact_context["resolved"]:
+                unresolved_facts.append(fact_index)
 
             acquired_context.append(fact_context)
 
-        return acquired_context, successful_tool_calls
+        return acquired_context, successful_tool_calls, unresolved_facts
+
+    def _recover_required_fact(
+        self,
+        candidate: CandidateIssue,
+        fact: RequiredFact,
+        candidate_index: int,
+        fact_index: int,
+        fact_context: dict,
+        state: ReviewState,
+    ) -> int:
+        successful_tool_calls = 0
+        messages = [
+            {
+                "role": "system",
+                "content": f"{REVIEW_PROMPT}\n\n{ACQUIRE_CONTEXT_PROMPT}",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Candidate:\n{json.dumps(asdict(candidate), ensure_ascii=False)}\n\n"
+                    f"Required fact:\n{json.dumps(asdict(fact), ensure_ascii=False)}\n\n"
+                    "Initial acquisition result:\n"
+                    f"{json.dumps(fact_context, ensure_ascii=False)}"
+                ),
+            },
+        ]
+
+        for _ in range(MAX_CONTEXT_TURNS_PER_FACT):
+            remaining = MAX_CONTEXT_TOOL_CALLS_PER_FACT - fact_context["tool_calls"]
+            if remaining <= 0 or state.tool_calls >= MAX_TOOL_CALLS:
+                break
+            message = self._request(messages, state, allow_tools=True)
+            tool_calls = message.tool_calls or []
+            self._append_assistant(messages, message)
+            if not tool_calls:
+                self._append_feedback(
+                    messages,
+                    state,
+                    "The required fact is unresolved. Call search_code or read_file.",
+                )
+                continue
+
+            for tool_call in tool_calls[:remaining]:
+                output, succeeded = self._execute_workflow_tool(
+                    tool_name=tool_call.function.name,
+                    arguments=tool_call.function.arguments,
+                    candidate_index=candidate_index,
+                    fact_index=fact_index,
+                    state=state,
+                    origin="model",
+                    tool_call_id=tool_call.id,
+                )
+                fact_context["tool_calls"] += 1
+                successful_tool_calls += int(succeeded)
+                parsed_output = json.loads(output)
+                if tool_call.function.name == "search_code":
+                    fact_context["search"] = parsed_output
+                elif tool_call.function.name == "read_file":
+                    fact_context["read"] = parsed_output
+                    if succeeded:
+                        fact_context["resolved"] = True
+                messages.append(
+                    {"role": "tool", "tool_call_id": tool_call.id, "content": output}
+                )
+                if fact_context["resolved"]:
+                    return successful_tool_calls
+
+        return successful_tool_calls
 
     def _execute_workflow_tool(
         self,
@@ -491,6 +960,8 @@ class OpenAIReviewer(Reviewer):
         candidate_index: int,
         fact_index: int,
         state: ReviewState,
+        origin: str = "workflow",
+        tool_call_id: str | None = None,
     ) -> tuple[str, bool]:
         if state.tool_calls >= MAX_TOOL_CALLS:
             tool_output = json.dumps(
@@ -514,9 +985,10 @@ class OpenAIReviewer(Reviewer):
                 "stage": "acquire_context",
                 "candidate_index": candidate_index,
                 "required_fact_index": fact_index,
+                **({"tool_call_id": tool_call_id} if tool_call_id else {}),
                 "name": tool_name,
                 "content": tool_output,
-                "origin": "workflow",
+                "origin": origin,
             }
         )
         return tool_output, succeeded
@@ -690,6 +1162,36 @@ class OpenAIReviewer(Reviewer):
         return successful_tool_calls
 
     @staticmethod
+    def _repository_sources_for_candidate(
+        repository_context: list[dict],
+        state: ReviewState,
+        candidate_index: int,
+    ) -> list[dict]:
+        sources = []
+
+        for fact_context in repository_context:
+            read_result = fact_context.get("read")
+            if isinstance(read_result, dict) and read_result.get("ok") is True:
+                sources.append(read_result)
+
+        for event in state.trace:
+            if (
+                event.get("type") != "tool_result"
+                or event.get("stage") != "verify"
+                or event.get("candidate_index") != candidate_index
+                or event.get("name") != "read_file"
+            ):
+                continue
+            try:
+                read_result = json.loads(event.get("content", ""))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(read_result, dict) and read_result.get("ok") is True:
+                sources.append(read_result)
+
+        return sources
+
+    @staticmethod
     def _append_assistant(messages: list[dict], message) -> None:
         tool_calls = message.tool_calls or []
         if not message.content and not tool_calls:
@@ -742,6 +1244,61 @@ class OpenAIReviewer(Reviewer):
         )
 
     @classmethod
+    def _parse_deduplication_groups(
+        cls, output_text: str, candidate_count: int
+    ) -> list[dict]:
+        data = cls._parse_json_object(output_text)
+        raw_groups = data.get("groups")
+        if not isinstance(raw_groups, list) or not raw_groups:
+            raise ValueError("DEDUPLICATE groups must be a non-empty list")
+
+        groups = []
+        seen = set()
+        for raw_group in raw_groups:
+            if not isinstance(raw_group, dict):
+                raise ValueError("Each deduplication group must be an object")
+            indices = raw_group.get("candidate_indices")
+            representative_index = raw_group.get("representative_index")
+            priority = raw_group.get("priority")
+            reason = raw_group.get("reason")
+            if not isinstance(indices, list) or not indices:
+                raise ValueError("candidate_indices must be a non-empty list")
+            if any(
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index < 0
+                or index >= candidate_count
+                for index in indices
+            ):
+                raise ValueError("candidate_indices must contain valid integers")
+            if len(set(indices)) != len(indices) or seen.intersection(indices):
+                raise ValueError("candidate indices must not repeat across groups")
+            if representative_index not in indices:
+                raise ValueError("representative_index must belong to its group")
+            if (
+                not isinstance(priority, int)
+                or isinstance(priority, bool)
+                or priority < 1
+                or priority > 5
+            ):
+                raise ValueError("deduplication priority must be an integer from 1 to 5")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("deduplication reason must be a non-empty string")
+            seen.update(indices)
+            groups.append(
+                {
+                    "candidate_indices": indices,
+                    "representative_index": representative_index,
+                    "priority": priority,
+                    "reason": reason,
+                }
+            )
+
+        if seen != set(range(candidate_count)):
+            raise ValueError("groups must include every candidate exactly once")
+        return sorted(groups, key=lambda group: min(group["candidate_indices"]))
+
+    @classmethod
     def _parse_candidates(
         cls,
         output_text: str,
@@ -757,13 +1314,16 @@ class OpenAIReviewer(Reviewer):
         cls,
         output_text: str,
         code_changes: str,
+        max_candidates: int = MAX_CANDIDATES,
     ) -> tuple[list[CandidateIssue], list[dict]]:
         data = cls._parse_json_object(output_text)
         raw_candidates = data.get("candidates")
         if not isinstance(raw_candidates, list):
             raise ValueError("DISCOVER candidates must be a list")
-        if len(raw_candidates) > MAX_CANDIDATES:
-            raise ValueError(f"DISCOVER returned more than {MAX_CANDIDATES} candidates")
+        if len(raw_candidates) > max_candidates:
+            raise ValueError(
+                f"DISCOVER returned more than {max_candidates} candidates"
+            )
 
         candidates = []
         rejections = []
@@ -820,19 +1380,35 @@ class OpenAIReviewer(Reviewer):
                 raise ValueError("Each evidence reference must be an object")
             side = raw_evidence.get("side")
             text = raw_evidence.get("text")
+            declared_evidence_file = raw_evidence.get("file")
+            if declared_evidence_file is not None and (
+                not isinstance(declared_evidence_file, str)
+                or not declared_evidence_file.strip()
+            ):
+                raise ValueError("Evidence file must be a non-empty string")
+            evidence_file = declared_evidence_file or file
             if side not in {"before", "after"}:
                 raise ValueError("Evidence side must be before or after")
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("Evidence text must be a non-empty string")
             if not cls._evidence_belongs_to_file(
-                file, EvidenceRef(side=side, text=text), code_changes
+                evidence_file,
+                EvidenceRef(side=side, text=text, file=declared_evidence_file),
+                code_changes,
             ):
                 raise ValueError(
                     f"Candidate {candidate_index} evidence {evidence_index} "
                     f"must match consecutive {side} source lines in its "
-                    f"declared file diff ({file})"
+                    f"evidence file diff ({evidence_file})"
                 )
-            evidence_refs.append(EvidenceRef(side=side, text=text))
+            evidence_refs.append(
+                EvidenceRef(side=side, text=text, file=declared_evidence_file)
+            )
+
+        if not any((reference.file or file) == file for reference in evidence_refs):
+            raise ValueError(
+                "Candidate file must appear in at least one evidence reference"
+            )
 
         fact_refs = []
         for raw_fact in required_facts:
@@ -928,6 +1504,9 @@ class OpenAIReviewer(Reviewer):
         candidates: list[CandidateIssue],
         repository_context_available: bool = False,
         expected_basis: str | None = None,
+        code_changes: str | None = None,
+        repository_sources: list[dict] | None = None,
+        require_supporting_evidence: bool = False,
     ) -> tuple[list[ReviewIssue], list[dict]]:
         data = cls._parse_json_object(output_text)
         raw_decisions = data.get("decisions")
@@ -950,8 +1529,8 @@ class OpenAIReviewer(Reviewer):
             seen.add(index)
 
             verdict = raw_decision.get("verdict")
-            if verdict not in {"keep", "revise", "drop"}:
-                raise ValueError("verdict must be keep, revise, or drop")
+            if verdict not in {"keep", "revise", "rejected", "drop"}:
+                raise ValueError("verdict must be keep, revise, or rejected")
             basis = raw_decision.get("basis")
             if basis not in {"diff", "repository"}:
                 raise ValueError("basis must be diff or repository")
@@ -971,10 +1550,18 @@ class OpenAIReviewer(Reviewer):
                 raise ValueError("verification reason must be a string")
 
             raw_issue = raw_decision.get("issue")
-            if verdict == "drop":
+            if verdict in {"rejected", "drop"}:
                 if raw_issue is not None:
-                    raise ValueError("drop decisions must have a null issue")
+                    raise ValueError("rejected decisions must have a null issue")
             else:
+                supporting_evidence = raw_decision.get("supporting_evidence")
+                if require_supporting_evidence:
+                    cls._validate_supporting_evidence(
+                        supporting_evidence,
+                        basis=basis,
+                        code_changes=code_changes,
+                        repository_sources=repository_sources or [],
+                    )
                 verified_issue = review_issue_from_dict(raw_issue)
                 if verified_issue.file != candidates[index].file:
                     raise ValueError(
@@ -988,10 +1575,77 @@ class OpenAIReviewer(Reviewer):
                     "verdict": verdict,
                     "basis": basis,
                     "reason": reason,
+                    "supporting_evidence": raw_decision.get(
+                        "supporting_evidence", []
+                    ),
                 }
             )
 
         return verified, decisions
+
+    @classmethod
+    def _validate_supporting_evidence(
+        cls,
+        raw_evidence: object,
+        basis: str,
+        code_changes: str | None,
+        repository_sources: list[dict],
+    ) -> None:
+        if not isinstance(raw_evidence, list) or not raw_evidence:
+            raise ValueError(
+                "keep and revise decisions require supporting_evidence"
+            )
+
+        has_repository_evidence = False
+        for reference in raw_evidence:
+            if not isinstance(reference, dict):
+                raise ValueError("Each supporting evidence reference must be an object")
+            source = reference.get("source")
+            file = reference.get("file")
+            text = reference.get("text")
+            if source not in {"diff", "repository"}:
+                raise ValueError("Supporting evidence source must be diff or repository")
+            if not isinstance(file, str) or not file.strip():
+                raise ValueError("Supporting evidence file must be a non-empty string")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("Supporting evidence text must be a non-empty string")
+
+            if source == "diff":
+                side = reference.get("side")
+                if side not in {"before", "after"}:
+                    raise ValueError("Diff supporting evidence requires before/after side")
+                if code_changes is None or not cls._evidence_belongs_to_file(
+                    file,
+                    EvidenceRef(file=file, side=side, text=text),
+                    code_changes,
+                ):
+                    raise ValueError(
+                        "Diff supporting evidence must match its declared file and side"
+                    )
+                continue
+
+            has_repository_evidence = True
+            normalized_file = file.removeprefix("./")
+            if not any(
+                isinstance(source_result.get("content"), str)
+                and source_result.get("path", "").removeprefix("./")
+                == normalized_file
+                and text in source_result["content"]
+                for source_result in repository_sources
+            ):
+                raise ValueError(
+                    "Repository supporting evidence must be an exact excerpt "
+                    "from a successful read_file result"
+                )
+
+        if basis == "diff" and any(
+            reference.get("source") != "diff" for reference in raw_evidence
+        ):
+            raise ValueError("diff basis may only use diff supporting evidence")
+        if basis == "repository" and not has_repository_evidence:
+            raise ValueError(
+                "repository basis requires repository supporting evidence"
+            )
 
     @classmethod
     def _parse_final_summary(cls, output_text: str) -> str:
