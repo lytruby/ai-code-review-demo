@@ -1,0 +1,63 @@
+{
+  "true_positives": [
+    {
+      "golden_index": 0,
+      "candidate_index": 1,
+      "confidence": 0.98,
+      "reasoning": "The candidate issue explicitly describes inconsistent metric tag keys using 'shard' versus 'shards' across related metrics, which is exactly the same underlying problem as the golden comment about inconsistent metric tagging with 'shard' and 'shards'.",
+      "golden_comment": "Inconsistent metric tagging with 'shard' and 'shards'",
+      "severity": "Medium",
+      "matched_candidate": "Metrics tag inconsistency: 'spans.buffer.flusher.produce' and 'spans.buffer.segment_size_bytes' use tag key 'shard', but 'spans.buffer.flusher.wait_produce' uses tag key 'shards'. This will cause metrics to be split across different tag names and make querying/dashboards inconsistent."
+    },
+    {
+      "golden_index": 4,
+      "candidate_index": 3,
+      "confidence": 0.84,
+      "reasoning": "Both comments flag the same control-flow problem: when the deadline is exceeded, the code breaks out of the loop early. The golden emphasizes that this can skip terminating remaining flusher processes (leaving them running), while the candidate notes it skips waiting/giving time to remaining processes. Although the candidate frames it as skipping waits rather than termination explicitly, it’s the same underlying deadline-break issue affecting handling of remaining processes.",
+      "golden_comment": "Breaking out of the loop when the deadline has elapsed can skip terminating remaining flusher processes, potentially leaving them running after shutdown; consider ensuring termination is attempted even if the deadline is exceeded.",
+      "severity": "Medium",
+      "matched_candidate": "In join(), the deadline check has a bug: if one process times out (remaining_time <= 0), the loop breaks and skips waiting for remaining processes. This means some processes may not be given any time to shut down."
+    }
+  ],
+  "false_positives": [
+    {
+      "candidate_index": 0,
+      "candidate": "In _ensure_processes_alive(), process_restarts is incremented AFTER checking against MAX_PROCESS_RESTARTS. This means the first restart attempt happens when process_restarts==0 (0 > 5 is False), so it never raises the RuntimeError until after 6 crashes instead of 5. More critically, after a crash, process_restarts is incremented but the check uses the OLD value, so the threshold is effectively MAX_PROCESS_RESTARTS+1."
+    },
+    {
+      "candidate_index": 2,
+      "candidate": "In _ensure_processes_alive(), when a process crashes and is restarted, the old process object is not removed from self.processes before _create_process_for_shards creates a new one. While the old process reference gets overwritten, if it's a zombie process that hasn't been fully reaped, calling kill() on it could fail or leave zombie processes. Additionally, there's no join/wait on the old process before starting a new one."
+    }
+  ],
+  "false_negatives": [
+    {
+      "golden_index": 1,
+      "golden_comment": "Fixed sleep in tests can be flaky; wait on condition instead",
+      "severity": "Low"
+    },
+    {
+      "golden_index": 2,
+      "golden_comment": "Because flusher processes are created via multiprocessing.get_context('spawn').Process, they are instances of multiprocessing.context.SpawnProcess, which on POSIX is not a subclass of multiprocessing.Process, so this isinstance check will always be false and hung processes won't be killed here.",
+      "severity": "High"
+    },
+    {
+      "golden_index": 3,
+      "golden_comment": "Sleep in test_consumer.py won’t actually wait because time.sleep was monkeypatched above; consider restoring sleep or using a different sync to ensure the flusher has time to process.",
+      "severity": "Medium"
+    }
+  ],
+  "errors": [],
+  "total_candidates": 4,
+  "total_golden": 5,
+  "tp": 2,
+  "fp": 2,
+  "fn": 3,
+  "errors_count": 0,
+  "precision": 0.5,
+  "recall": 0.4,
+  "f1": 0.4444444444444445,
+  "case_id": "sentry-93824",
+  "provider": "kimi",
+  "run_name": "tool-or-complete-v1",
+  "judge_model": "gpt-5.2"
+}

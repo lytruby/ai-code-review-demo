@@ -13,13 +13,13 @@ from openai import OpenAI
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = PROJECT_ROOT / ".env"
 BASE_URL = "https://api.moonshot.cn/v1"
-DEFAULT_MODEL = "kimi-k2.6"
+DEFAULT_MODEL = "kimi-k3"
 
 
 def main() -> int:
     load_dotenv(ENV_FILE)
     api_key = os.environ.get("MOONSHOT_API_KEY")
-    model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
+    model = os.environ.get("LLM_MODEL") or os.environ.get("KIMI_MODEL", DEFAULT_MODEL)
 
     if not api_key:
         print("FAIL: MOONSHOT_API_KEY is missing from .env or the environment")
@@ -28,7 +28,7 @@ def main() -> int:
     client = OpenAI(
         api_key=api_key,
         base_url=BASE_URL,
-        timeout=30.0,
+        timeout=120.0,
         max_retries=0,
     )
 
@@ -46,6 +46,11 @@ def main() -> int:
             return 1
 
         started = time.monotonic()
+        options = (
+            {"reasoning_effort": os.environ.get("LLM_REASONING_EFFORT", "low")}
+            if model.startswith("kimi-k3")
+            else {"extra_body": {"thinking": {"type": "disabled"}}}
+        )
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -54,8 +59,8 @@ def main() -> int:
                     "content": "Reply with exactly: KIMI_OK",
                 }
             ],
-            max_completion_tokens=32,
-            extra_body={"thinking": {"type": "disabled"}},
+            max_completion_tokens=1024,
+            **options,
         )
         elapsed = time.monotonic() - started
         content = response.choices[0].message.content or ""

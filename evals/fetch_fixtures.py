@@ -76,13 +76,26 @@ def fetch_fixture(
         if not isinstance(files, list):
             raise ValueError(f"Unexpected files response for {case['id']}")
 
-        changes.extend(
-            {
-                "filename": item["filename"],
-                "patch": item.get("patch", "Patch unavailable for this file."),
-            }
-            for item in files
-        )
+        for item in files:
+            patch = item.get("patch")
+            # GitHub omits patch for empty-file additions/removals. The known
+            # empty Git blob identifies these without treating an omitted
+            # binary/large-file diff as an empty text change.
+            if patch is None and item.get("sha") == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391" and item.get("changes") == 0:
+                patch = f"Empty file {item.get('status', 'changed')} (no text content)."
+            elif (
+                patch is None
+                and item.get("status") == "renamed"
+                and all(item.get(key) == 0 for key in ("changes", "additions", "deletions"))
+                and isinstance(item.get("previous_filename"), str)
+                and item["previous_filename"]
+            ):
+                patch = (
+                    "similarity index 100%\n"
+                    f"rename from {item['previous_filename']}\n"
+                    f"rename to {item['filename']}"
+                )
+            changes.append({"filename": item["filename"], "patch": patch if patch is not None else "Patch unavailable for this file."})
 
         if len(files) < 100:
             break

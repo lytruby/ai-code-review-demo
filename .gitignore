@@ -12,3 +12,9 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+evals/repositories/
+evals/runs/**/result.json
+evals/runs/**/evaluation.json
+evals/runs/**/error*.json
+evals/benchmark-data/
+evals/benchmark-runs/

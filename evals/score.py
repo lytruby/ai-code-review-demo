@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import re
 from typing import Protocol
 
 from dotenv import load_dotenv
@@ -96,13 +97,60 @@ class OpenAIJudge:
         return json.loads(content)
 
 
+def _select_one_to_one_matches(
+    matches: list[dict],
+    golden_count: int,
+) -> list[dict]:
+    """Maximize match count first, then total judge confidence."""
+    edges_by_golden: list[list[dict]] = [[] for _ in range(golden_count)]
+    for match in matches:
+        edges_by_golden[match["golden_index"]].append(match)
+    for edges in edges_by_golden:
+        edges.sort(key=lambda edge: (-edge["confidence"], edge["candidate_index"]))
+
+    cache: dict[tuple[int, int], tuple[int, float, tuple[dict, ...]]] = {}
+
+    def solve(
+        golden_index: int,
+        used_candidates: int,
+    ) -> tuple[int, float, tuple[dict, ...]]:
+        key = (golden_index, used_candidates)
+        if key in cache:
+            return cache[key]
+        if golden_index == golden_count:
+            return 0, 0.0, ()
+
+        best = solve(golden_index + 1, used_candidates)
+        for edge in edges_by_golden[golden_index]:
+            candidate_bit = 1 << edge["candidate_index"]
+            if used_candidates & candidate_bit:
+                continue
+            count, confidence, selected = solve(
+                golden_index + 1,
+                used_candidates | candidate_bit,
+            )
+            option = (
+                count + 1,
+                confidence + edge["confidence"],
+                (edge, *selected),
+            )
+            if option[:2] > best[:2]:
+                best = option
+
+        cache[key] = best
+        return best
+
+    return list(solve(0, 0)[2])
+
+
 def load_inputs(
     case_id: str,
     provider: str,
+    run_name: str,
     runs_dir: Path = RUNS_DIR,
     golden_dir: Path = GOLDEN_DIR,
 ) -> tuple[list[dict], list[dict]]:
-    result_path = runs_dir / provider.lower() / case_id / "result.json"
+    result_path = runs_dir / provider.lower() / run_name / case_id / "result.json"
     golden_path = golden_dir / f"{case_id}.json"
 
     if not result_path.is_file():
@@ -136,8 +184,8 @@ async def evaluate(
             task_metadata.append((golden_index, candidate_index))
 
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-    golden_matches: list[dict | None] = [None] * len(golden_comments)
-    candidate_matched = [False] * len(candidates)
+    pairwise_judgments = []
+    possible_matches = []
     errors = []
 
     for metadata, result in zip(task_metadata, raw_results, strict=True):
@@ -152,24 +200,32 @@ async def evaluate(
             )
             continue
 
-        if not result.get("match"):
-            continue
+        judgment = {
+            "golden_index": golden_index,
+            "candidate_index": candidate_index,
+            "match": result.get("match") is True,
+            "confidence": max(0.0, min(1.0, float(result.get("confidence", 0.0)))),
+            "reasoning": result.get("reasoning", ""),
+        }
+        pairwise_judgments.append(judgment)
+        if judgment["match"]:
+            possible_matches.append(judgment)
 
-        confidence = float(result.get("confidence", 0.0))
-        current = golden_matches[golden_index]
-        if current is None or confidence > current["confidence"]:
-            golden_matches[golden_index] = {
-                "golden_index": golden_index,
-                "candidate_index": candidate_index,
-                "confidence": confidence,
-                "reasoning": result.get("reasoning", ""),
-            }
-        candidate_matched[candidate_index] = True
+    selected_matches = _select_one_to_one_matches(
+        possible_matches,
+        golden_count=len(golden_comments),
+    )
+    selected_by_golden = {
+        match["golden_index"]: match for match in selected_matches
+    }
+    selected_candidate_indices = {
+        match["candidate_index"] for match in selected_matches
+    }
 
     true_positives = []
     false_negatives = []
     for golden_index, golden in enumerate(golden_comments):
-        match = golden_matches[golden_index]
+        match = selected_by_golden.get(golden_index)
         if match is None:
             false_negatives.append(
                 {
@@ -190,18 +246,44 @@ async def evaluate(
             }
         )
 
-    false_positives = [
-        {
-            "candidate_index": index,
+    false_positives = []
+    for candidate_index, candidate in enumerate(candidates):
+        if candidate_index in selected_candidate_indices:
+            continue
+        duplicate_edges = [
+            edge
+            for edge in possible_matches
+            if edge["candidate_index"] == candidate_index
+            and edge["golden_index"] in selected_by_golden
+        ]
+        false_positive = {
+            "candidate_index": candidate_index,
             "candidate": candidate["description"],
+            "reason": "unmatched",
         }
-        for index, candidate in enumerate(candidates)
-        if not candidate_matched[index]
-    ]
+        if duplicate_edges:
+            competing_edge = max(
+                duplicate_edges,
+                key=lambda edge: (edge["confidence"], -edge["golden_index"]),
+            )
+            selected = selected_by_golden[competing_edge["golden_index"]]
+            false_positive.update(
+                {
+                    "reason": "duplicate_match",
+                    "competing_golden_index": competing_edge["golden_index"],
+                    "selected_candidate_index": selected["candidate_index"],
+                    "match_confidence": competing_edge["confidence"],
+                }
+            )
+        false_positives.append(false_positive)
 
     tp = len(true_positives)
     fp = len(false_positives)
     fn = len(false_negatives)
+    if tp + fp != len(candidates):
+        raise RuntimeError("Scorer invariant failed: tp + fp != total_candidates")
+    if tp + fn != len(golden_comments):
+        raise RuntimeError("Scorer invariant failed: tp + fn != total_golden")
     precision = tp / len(candidates) if candidates else 0.0
     recall = tp / len(golden_comments) if golden_comments else 0.0
     f1 = (
@@ -214,6 +296,7 @@ async def evaluate(
         "true_positives": true_positives,
         "false_positives": false_positives,
         "false_negatives": false_negatives,
+        "pairwise_judgments": pairwise_judgments,
         "errors": errors,
         "total_candidates": len(candidates),
         "total_golden": len(golden_comments),
@@ -233,16 +316,26 @@ async def async_main() -> None:
     )
     parser.add_argument("--case-id", required=True)
     parser.add_argument("--provider", required=True)
+    parser.add_argument("--run-name", required=True)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.provider):
+        parser.error("Provider may contain only letters, numbers, '-' and '_'")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_name):
+        parser.error("Run name may contain only letters, numbers, '-' and '_'")
+
     provider = args.provider.lower()
-    case_dir = RUNS_DIR / provider / args.case_id
+    case_dir = RUNS_DIR / provider / args.run_name / args.case_id
     output_path = case_dir / "evaluation.json"
     if output_path.exists() and not args.force:
         parser.error(f"Evaluation already exists: {output_path}; use --force")
 
-    candidates, golden_comments = load_inputs(args.case_id, provider)
+    candidates, golden_comments = load_inputs(
+        args.case_id,
+        provider,
+        args.run_name,
+    )
     judge = OpenAIJudge()
     comparisons = len(candidates) * len(golden_comments)
     print(
@@ -252,6 +345,7 @@ async def async_main() -> None:
     evaluation = await evaluate(judge, candidates, golden_comments)
     evaluation["case_id"] = args.case_id
     evaluation["provider"] = provider
+    evaluation["run_name"] = args.run_name
     evaluation["judge_model"] = judge.model
 
     case_dir.mkdir(parents=True, exist_ok=True)
