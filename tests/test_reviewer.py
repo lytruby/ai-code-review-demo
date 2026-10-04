@@ -151,31 +151,33 @@ def test_reviewer_runs_discover_verify_and_finalize_with_tool(tmp_path):
 
     assert result.summary == "One issue found"
     assert result.issues[0].file == "example.py"
-    assert len(completions.requests) == 7
+    assert len(completions.requests) == 8
     assert "Stage: DISCOVER" in completions.requests[0]["messages"][0]["content"]
     discover_prompt = completions.requests[0]["messages"][0]["content"]
     assert f"Return at most {MAX_CANDIDATES_PER_DISCOVERY_PASS} candidates" in discover_prompt
     assert "ordered by evidence strength" in discover_prompt
     assert "must declare the required facts" in discover_prompt
     assert "tools" not in completions.requests[0]
-    assert "Stage: VERIFY" in completions.requests[4]["messages"][0]["content"]
-    verify_prompt = completions.requests[4]["messages"][0]["content"]
+    assert "Stage: VERIFY" in completions.requests[5]["messages"][0]["content"]
+    verify_prompt = completions.requests[5]["messages"][0]["content"]
     assert "smallest concrete defect" in verify_prompt
     assert "appears intentional" in verify_prompt
     assert "return revise and remove or narrow" in verify_prompt
-    assert completions.requests[4]["tools"][0]["function"]["name"] == "read_file"
-    assert completions.requests[4]["tools"][1]["function"]["name"] == "search_code"
-    assert "Stage: FINALIZE" in completions.requests[6]["messages"][0]["content"]
+    assert completions.requests[5]["tools"][0]["function"]["name"] == "read_file"
+    assert completions.requests[5]["tools"][1]["function"]["name"] == "search_code"
+    assert "Stage: FINALIZE" in completions.requests[7]["messages"][0]["content"]
     # JSON mode is only sent on turns without tools.
     assert completions.requests[0]["response_format"] == {"type": "json_object"}
-    assert "response_format" not in completions.requests[4]
     assert "response_format" not in completions.requests[5]
-    assert completions.requests[6]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in completions.requests[6]
+    assert completions.requests[7]["response_format"] == {"type": "json_object"}
 
-    verify_after_tool = completions.requests[5]["messages"]
+    verify_after_tool = completions.requests[6]["messages"]
     assert verify_after_tool[-1]["role"] == "tool"
     assert "def divide" in verify_after_tool[-1]["content"]
     assert [event["stage"] for event in reviewer.last_trace if "stage" in event and event["type"] != "tool_gateway_decision"] == [
+        "discover",
+        "discover",
         "discover",
         "discover",
         "discover",
@@ -195,7 +197,7 @@ def test_reviewer_runs_discover_verify_and_finalize_with_tool(tmp_path):
     ]
     assert reviewer.last_state is not None
     assert reviewer.last_state.stage == "complete"
-    assert reviewer.last_state.model_turns == 7
+    assert reviewer.last_state.model_turns == 8
     assert reviewer.last_state.tool_calls == 1
 
 
@@ -228,11 +230,11 @@ def test_kimi_requests_use_fast_baseline_settings(tmp_path, monkeypatch):
 
     reviewer.review([{"filename": "example.py", "patch": "+value = 1"}])
 
-    assert len(completions.requests) == 6
+    assert len(completions.requests) == 7
     assert completions.requests[0]["max_completion_tokens"] == 4096
-    for request in completions.requests[1:4]:
+    for request in completions.requests[1:5]:
         assert request["max_completion_tokens"] == 4096
-    for request in completions.requests[4:]:
+    for request in completions.requests[5:]:
         assert request["max_completion_tokens"] == 2048
     for request in completions.requests:
         assert request["extra_body"] == {"thinking": {"type": "disabled"}}
@@ -264,7 +266,7 @@ def test_kimi_k3_requests_use_low_reasoning_effort(tmp_path, monkeypatch):
 
     reviewer.review([{"filename": "example.py", "patch": "+value = 1"}])
 
-    assert len(completions.requests) == 6
+    assert len(completions.requests) == 7
     for request in completions.requests:
         assert request["reasoning_effort"] == "low"
         assert "extra_body" not in request
@@ -345,7 +347,7 @@ def test_gpt_5_6_requests_use_medium_reasoning_effort(tmp_path, monkeypatch):
 
     reviewer.review([{"filename": "example.py", "patch": "+value = 1"}])
 
-    assert len(responses.requests) == 5
+    assert len(responses.requests) == 6
     for request in responses.requests:
         assert request["reasoning"] == {"effort": "medium"}
         assert request["text"] == {"format": {"type": "json_object"}}
@@ -479,8 +481,8 @@ def test_reviewer_retries_transient_api_error_without_using_model_turn(
     result = reviewer.review([{"filename": "example.py", "patch": "+value = 1"}])
 
     assert result.summary == "No issues"
-    assert reviewer.last_state.model_turns == 6
-    assert reviewer.last_state.api_attempts == 7
+    assert reviewer.last_state.model_turns == 7
+    assert reviewer.last_state.api_attempts == 8
     request_errors = [
         event
         for event in reviewer.last_trace
@@ -516,7 +518,7 @@ def test_reviewer_retries_invalid_discover_output(tmp_path):
     result = reviewer.review([{"filename": "example.py", "patch": "+value = 1"}])
 
     assert result.status == "complete"
-    assert len(completions.requests) == 7
+    assert len(completions.requests) == 8
     retry_messages = completions.requests[1]["messages"]
     assert retry_messages[-1]["role"] == "user"
     assert "Invalid DISCOVER output" in retry_messages[-1]["content"]
@@ -549,7 +551,7 @@ def test_reviewer_keeps_valid_candidates_when_one_candidate_is_rejected(tmp_path
     result = reviewer.review([{"filename": "example.py", "patch": "+value = 1"}])
 
     assert result.issues == []
-    assert len(completions.requests) == 6
+    assert len(completions.requests) == 7
     rejection_event = next(
         event
         for event in reviewer.last_trace
@@ -717,7 +719,7 @@ def test_reviewer_retries_empty_verify_response_without_replaying_it(tmp_path):
     result = reviewer.review([{"filename": "example.py", "patch": "+value = 1"}])
 
     assert result.issues == []
-    retry_messages = completions.requests[5]["messages"]
+    retry_messages = completions.requests[6]["messages"]
     assert retry_messages[-1]["role"] == "user"
     assert "Invalid VERIFY output" in retry_messages[-1]["content"]
     assert not any(
@@ -809,17 +811,17 @@ def test_reviewer_verifies_candidates_in_separate_model_calls(tmp_path):
     )
 
     assert [issue.file for issue in result.issues] == ["second.py"]
-    assert len(completions.requests) == 8
-    assert '"claim": "First claim"' in completions.requests[5]["messages"][1]["content"]
-    assert '"claim": "Second claim"' in completions.requests[6]["messages"][1]["content"]
+    assert len(completions.requests) == 9
+    assert '"claim": "First claim"' in completions.requests[6]["messages"][1]["content"]
+    assert '"claim": "Second claim"' in completions.requests[7]["messages"][1]["content"]
     # Shared changes come before candidate text so the cached prefix is reused.
-    first_verify = completions.requests[5]["messages"]
-    second_verify = completions.requests[6]["messages"]
+    first_verify = completions.requests[6]["messages"]
+    second_verify = completions.requests[7]["messages"]
     assert first_verify[0] == second_verify[0]
     prefix = first_verify[1]["content"].split("Candidate:")[0]
     assert "+first()" in prefix and "+second()" in prefix
     assert second_verify[1]["content"].startswith(prefix)
-    discover_requests = completions.requests[:4]
+    discover_requests = completions.requests[:5]
     discover_prefix = discover_requests[0]["messages"][1]["content"].split("Discovery pass:")[0]
     assert "+first()" in discover_prefix
     for request in discover_requests:
@@ -849,6 +851,7 @@ def test_discover_merges_independent_correctness_and_state_passes(tmp_path):
         [
             response(f'{{"candidates":[{correctness}]}}'),
             response(f'{{"candidates":[{state}]}}'),
+            response('{"candidates":[]}'),
             response('{"candidates":[]}'),
             response('{"candidates":[]}'),
             response(
@@ -889,6 +892,7 @@ def test_discover_merges_independent_correctness_and_state_passes(tmp_path):
         "state_and_concurrency": 1,
         "behavioral_consistency": 0,
         "tests_quality": 0,
+        "line_details": 0,
     }
 
 

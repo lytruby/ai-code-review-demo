@@ -2292,3 +2292,31 @@ rejected。其中 2 个命中 golden（metric tag 命名、`TwoFactor` 导出名
 
 不能下的结论：两次运行无法区分 cap12 召回下降是噪声还是因果；归因是按文本
 对照得出的，未经 Judge 评分。
+
+## 2026-10-04：每个 discover pass 3 → 5 个候选（pass5-r1 / r2）
+
+代码 b4bacaf：`MAX_CANDIDATES_PER_DISCOVERY_PASS` 3 → 5，`MAX_CANDIDATES`
+→ 16，`MAX_TOOL_CALLS` → 80。同样 4 个案例各跑 2 次。
+
+| | 基线 r1+r2 | cap12 r1+r2 | pass5 r1+r2 |
+|---|---:|---:|---:|
+| TP / FP / FN（core） | 20 / 15 / 14 | 15 / 29 / 19 | 23 / 31 / 11 |
+| Precision | 57.1% | 34.1% | 42.6% |
+| Recall | 58.8% | 44.1% | 67.6% |
+| Core F1 | 58.0% | 38.5% | 52.3% |
+| 未命中缓存 prompt | 35.0 万 | 29.5 万 | 40.7 万 |
+| 命中缓存 prompt | 84.4 万 | 96.0 万 | 134.9 万 |
+| 输出 | 11.9 万 | 13.0 万 | 17.4 万 |
+
+两次 recall（70.6%、64.7%）都不低于基线两次（64.7%、52.9%）。
+sentry-93824 两次全中；sentry-67876 的 pipeline.signature 问题两次都命中
+（基线 1/2）。代价是 prompt 总量约 +47%、输出 +46%，FP 翻倍。
+
+剩余 11 条漏报里，8 条属于 12 次 review 中从未被发现的 4 条 golden：
+github_authenticated_user 缺失时的空引用、时间窗口用 device.UpdatedAt
+而不是当前时间、disable 接口错误信息写成 “backup code login”、indexOf
+大小写敏感。tagDeviceUI 先写缓存这一条在 pass5-r2 被发现，但 verify 认为
+“PR 之前就存在”而驳回。
+
+不能下的结论：2 次运行的 recall 差异仍在噪声范围边缘；FP 增加中有多少是
+golden 未收录的真问题，没有核查。
