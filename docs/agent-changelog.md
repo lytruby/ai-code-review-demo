@@ -2320,3 +2320,27 @@ github_authenticated_user 缺失时的空引用、时间窗口用 device.Updated
 
 不能下的结论：2 次运行的 recall 差异仍在噪声范围边缘；FP 增加中有多少是
 golden 未收录的真问题，没有核查。
+
+## 2026-10-04：新增逐行细节 discover pass（details-r1 / r2），撤回改动
+
+代码 a09c230：在 pass5 基础上新增第 5 个 pass `line_details`，逐个 hunk 找
+错误文案、大小写/规范化比较、可能缺失的状态查找、时间边界、未释放资源；
+`MAX_CANDIDATES` → 20，`MAX_TOOL_CALLS` → 100。同样 4 个案例各跑 2 次。
+
+| | pass5 r1+r2 | details r1+r2 |
+|---|---:|---:|
+| TP / FP / FN（core） | 23 / 31 / 11 | 22 / 32 / 12 |
+| Precision | 42.6% | 40.7% |
+| Recall | 67.6% | 64.7% |
+| Core F1 | 52.3% | 50.0% |
+| 未命中缓存 prompt | 40.7 万 | 39.7 万 |
+| 命中缓存 prompt | 134.9 万 | 123.3 万 |
+| 输出 | 17.4 万 | 18.3 万 |
+
+时间窗口那条 golden 第一次被命中（details-r1），tagDeviceUI 缓存和 Object
+URL 也各多命中一次，但 sentry-67876 的 pipeline.signature 和 grafana 的
+updateDevice 又各漏了，总体与 pass5 持平。github_authenticated_user 空引用、
+“backup code login” 文案、indexOf 大小写仍在 16 次 review 中从未发现。
+
+结论：没有可测出的收益，而且这个 pass 是看着 dev 集漏报设计的，有过拟合
+风险，因此撤回，保留 pass5 配置。
