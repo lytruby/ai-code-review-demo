@@ -33,9 +33,6 @@ MAX_TOOL_CALLS = 40
 MAX_REQUIRED_FACTS_PER_CANDIDATE = 2
 MAX_CANDIDATES_PER_DISCOVERY_PASS = 3
 MAX_CANDIDATES = 8
-# Lower-priority diff-only candidates past MAX_CANDIDATES share one batch call.
-MAX_BATCH_VERIFY_CANDIDATES = 4
-MAX_BATCH_VERIFY_TURNS = 2
 MAX_DISCOVER_TURNS = 2
 MAX_DEDUPLICATE_TURNS = 2
 MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
@@ -52,7 +49,6 @@ MAX_MODEL_TURNS = (
         MAX_VERIFY_TURNS_PER_CANDIDATE
         + MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE
     )
-    + MAX_BATCH_VERIFY_TURNS
     + MAX_FINALIZE_TURNS
 )
 TRANSIENT_API_ERRORS = (
@@ -302,56 +298,6 @@ cannot support a keep or revise decision, return inconclusive with issue=null;
 do not switch basis to bypass a required repository fact.
 """
 
-BATCH_VERIFY_PROMPT = """\
-Stage: BATCH VERIFY
-
-Verify each supplied candidate independently using only the supplied diff.
-No tools are available. Choose exactly one verdict per candidate:
-- keep: the candidate is supported as written;
-- revise: there is a real issue, but its description or suggestion needs repair;
-- rejected: the candidate is contradicted, speculative, non-actionable, or only a
-  future maintenance concern.
-- inconclusive: the diff alone is insufficient to decide.
-
-Judge each candidate's smallest concrete defect separately from any overstated
-scope, severity, or suggested fix; revise rather than reject when the core
-defect remains supported. Do not treat a behavior as correct merely because it
-appears intentional. Do not create new candidates.
-
-Return only valid JSON with one decision per candidate, using each candidate's
-candidate_index from the input and basis=diff:
-{
-  "decisions": [
-    {
-      "candidate_index": 0,
-      "verdict": "keep | revise | rejected | inconclusive",
-      "basis": "diff",
-      "reason": "Why this verdict is supported",
-      "supporting_evidence": [
-        {
-          "source": "diff",
-          "file": "path/to/file.py",
-          "side": "before | after",
-          "text": "Exact consecutive source excerpt"
-        }
-      ],
-      "issue": {
-        "file": "path/to/file.py",
-        "severity": "low | medium | high",
-        "description": "Verified issue",
-        "suggestion": "Verified suggestion"
-      }
-    }
-  ]
-}
-
-For rejected and inconclusive decisions, issue must be null. For keep and
-revise decisions, supporting_evidence must contain exact diff excerpts
-supporting every behavioral assertion in the description. A diff-based reason
-must not assert facts about definitions, call sites, configuration, or runtime
-state outside the diff.
-"""
-
 ACQUIRE_CONTEXT_PROMPT = """\
 Stage: ACQUIRE_CONTEXT
 
@@ -393,7 +339,6 @@ ReviewStage = Literal[
 class ReviewState:
     stage: ReviewStage = "discover"
     candidates: list[CandidateIssue] = field(default_factory=list)
-    batch_candidates: list[CandidateIssue] = field(default_factory=list)
     verified_issues: list[ReviewIssue] = field(default_factory=list)
     trace: list[dict] = field(default_factory=list)
     model_turns: int = 0
@@ -593,13 +538,7 @@ class OpenAIReviewer(Reviewer):
         state.stage = "deduplicate"
         merged = self._deduplicate_candidates(merged, state)
         after_semantic_dedup = len(merged)
-        overflow = merged[MAX_CANDIDATES:]
         merged = merged[:MAX_CANDIDATES]
-        # Candidates that need no repository facts are cheap to verify from the
-        # diff alone, so keep them for one batch call instead of dropping them.
-        state.batch_candidates = [
-            candidate for candidate in overflow if not candidate.required_facts
-        ][:MAX_BATCH_VERIFY_CANDIDATES]
         state.stage = "discover"
 
         state.trace.append(
@@ -611,8 +550,7 @@ class OpenAIReviewer(Reviewer):
                 "candidate_count_after_semantic_dedup": after_semantic_dedup,
                 "candidate_count_truncated": max(
                     0, after_semantic_dedup - MAX_CANDIDATES
-                ) - len(state.batch_candidates),
-                "batch_candidate_count": len(state.batch_candidates),
+                ),
                 "rejected_candidate_count": sum(pass_rejection_counts),
                 "pass_candidate_counts": {
                     name: len(candidates)
@@ -842,14 +780,6 @@ class OpenAIReviewer(Reviewer):
             verified.extend(candidate_issues)
             decisions.append(candidate_decision)
 
-        if state.batch_candidates:
-            state.stage = "verify"
-            batch_issues, batch_decisions = self._verify_batch(
-                code_changes, state.batch_candidates, len(state.candidates), state
-            )
-            verified.extend(batch_issues)
-            decisions.extend(batch_decisions)
-
         state.trace.append(
             {
                 "type": "stage_result",
@@ -867,76 +797,6 @@ class OpenAIReviewer(Reviewer):
             }
         )
         return verified
-
-    def _verify_batch(
-        self,
-        code_changes: str,
-        candidates: list[CandidateIssue],
-        index_offset: int,
-        state: ReviewState,
-    ) -> tuple[list[ReviewIssue], list[dict]]:
-        messages = [
-            {"role": "system", "content": f"{REVIEW_PROMPT}\n\n{BATCH_VERIFY_PROMPT}"},
-            {
-                "role": "user",
-                "content": (
-                    f"Untrusted changes:\n{code_changes}\n\n"
-                    "Verify these candidates against the changes above.\n\n"
-                    "Candidates:\n"
-                    + json.dumps(
-                        [
-                            {"candidate_index": index, **asdict(candidate)}
-                            for index, candidate in enumerate(candidates)
-                        ],
-                        ensure_ascii=False,
-                    )
-                ),
-            },
-        ]
-        last_validation_error = None
-        for _ in range(MAX_BATCH_VERIFY_TURNS):
-            message = self._request(messages, state, allow_tools=False)
-            self._append_assistant(messages, message)
-            try:
-                verified, local_decisions = self._parse_decisions(
-                    message.content or "",
-                    candidates,
-                    expected_basis="diff",
-                    code_changes=code_changes,
-                    require_supporting_evidence=True,
-                )
-            except ValueError as error:
-                last_validation_error = str(error)
-                self._append_feedback(
-                    messages, state,
-                    f"Invalid BATCH VERIFY output: {error}. Return exactly "
-                    f"{len(candidates)} decisions, one per candidate_index, with basis=diff.",
-                )
-                continue
-            decisions = []
-            for local in local_decisions:
-                decision = {**local, "candidate_index": index_offset + local["candidate_index"]}
-                state.trace.append(
-                    {"type": "candidate_result", "stage": "verify", "batch": True, **decision}
-                )
-                decisions.append(decision)
-            return verified, decisions
-
-        decisions = []
-        for local_index in range(len(candidates)):
-            decision = {
-                "candidate_index": index_offset + local_index,
-                "verdict": "inconclusive",
-                "basis": "diff",
-                "reason": "Batch verification did not produce a valid decision",
-                "failure_kind": "verification_turn_limit",
-                "last_validation_error": last_validation_error,
-            }
-            state.trace.append(
-                {"type": "candidate_result", "stage": "verify", "batch": True, **decision}
-            )
-            decisions.append(decision)
-        return [], decisions
 
     def _verify_candidate(
         self,
