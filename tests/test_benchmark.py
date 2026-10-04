@@ -242,3 +242,15 @@ def test_runtime_uncertainty_and_summary_are_not_scored_as_findings():
     review['summary'] = 'Context insufficient: tool_protocol_error; not a no-issues conclusion'
     review['trace'] = [{'type':'candidate_result','candidate_index':0,'verdict':'inconclusive','failure_kind':'tool_protocol_error','reason':'Missing context'}]
     assert candidate_texts(review) == expected
+
+
+def test_review_usage_splits_cached_prompt_tokens():
+    from evals.benchmark import review_usage
+
+    usage = review_usage([
+        {"usage": {"prompt_tokens": 100, "completion_tokens": 10, "cached_tokens": 60}},
+        {"usage": {"prompt_tokens": 50, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 20}}},
+        {"usage": None},
+    ])
+    assert usage == {"prompt_tokens": 150, "cached_prompt_tokens": 80,
+                     "completion_tokens": 15, "uncached_prompt_tokens": 70}

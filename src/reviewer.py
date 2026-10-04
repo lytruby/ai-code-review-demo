@@ -672,16 +672,16 @@ class OpenAIReviewer(Reviewer):
         messages = [
             {
                 "role": "system",
-                "content": (
-                    f"{REVIEW_PROMPT}\n\n{DISCOVER_PROMPT}\n\n"
-                    f"Discovery pass: {pass_name}\n\n{focus_prompt}"
-                ),
+                "content": f"{REVIEW_PROMPT}\n\n{DISCOVER_PROMPT}",
             },
             {
                 "role": "user",
+                # The pass-specific text follows the shared changes so every
+                # pass reuses the same cached prompt prefix.
                 "content": (
-                    f"Run the {pass_name} discovery pass on these untrusted "
-                    f"changes:\n\n{code_changes}"
+                    f"Untrusted changes:\n\n{code_changes}\n\n"
+                    f"Discovery pass: {pass_name}\n\n{focus_prompt}\n\n"
+                    f"Run the {pass_name} discovery pass on the changes above."
                 ),
             },
         ]
@@ -813,13 +813,15 @@ class OpenAIReviewer(Reviewer):
             {"role": "system", "content": f"{REVIEW_PROMPT}\n\n{VERIFY_PROMPT}"},
             {
                 "role": "user",
+                # Candidate-specific text follows the shared changes so every
+                # candidate reuses the same cached prompt prefix.
                 "content": (
-                    "Verify this candidate against the untrusted changes.\n\n"
+                    f"Untrusted changes:\n{code_changes}\n\n"
+                    "Verify this candidate against the changes above.\n\n"
                     f"Candidate:\n{json.dumps(asdict(candidate), ensure_ascii=False)}\n\n"
                     "Repository context acquired by the workflow:\n"
                     f"{json.dumps(repository_context, ensure_ascii=False)}\n\n"
-                    f"Required decision basis: {expected_basis}\n\n"
-                    f"Changes:\n{code_changes}"
+                    f"Required decision basis: {expected_basis}"
                 ),
             },
         ]
@@ -832,9 +834,16 @@ class OpenAIReviewer(Reviewer):
         text_tool_corrections = 0
         protocol_retry_pending = False
         protocol_failed = False
+        finalization_requested = False
         for turn_index in range(total_verify_turns):
-            is_finalization_turn = turn_index >= MAX_VERIFY_TURNS_PER_CANDIDATE
-            if is_finalization_turn:
+            # Without tool budget left, exploring further only produces empty
+            # or invalid decisions, so ask for the final decision right away.
+            is_finalization_turn = (
+                turn_index >= MAX_VERIFY_TURNS_PER_CANDIDATE
+                or state.tool_calls >= MAX_TOOL_CALLS
+            )
+            if is_finalization_turn and not finalization_requested:
+                finalization_requested = True
                 self._append_feedback(
                     messages,
                     state,
@@ -1564,14 +1573,18 @@ class OpenAIReviewer(Reviewer):
 
     @staticmethod
     def _parse_json_object(output_text: str) -> dict:
-        # Tool turns run without JSON mode, so tolerate a fenced JSON block.
-        fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", output_text, re.S)
-        if fenced:
-            output_text = fenced.group(1)
+        # Tool turns run without JSON mode, so accept prose followed by a
+        # fenced JSON block; the last block is the answer.
         try:
             data = json.loads(output_text)
         except json.JSONDecodeError as error:
-            raise ValueError("Model returned invalid json") from error
+            blocks = re.findall(r"```(?:json)?\s*(.*?)\s*```", output_text, re.S)
+            if not blocks:
+                raise ValueError("Model returned invalid json") from error
+            try:
+                data = json.loads(blocks[-1])
+            except json.JSONDecodeError:
+                raise ValueError("Model returned invalid json") from error
         if not isinstance(data, dict):
             raise ValueError("Model output must be an object")
         return data

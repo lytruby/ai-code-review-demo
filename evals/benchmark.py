@@ -105,6 +105,7 @@ def report(data_dir: Path, run_dir: Path) -> dict:
             responses = [e for e in result.get("trace", []) if e.get("type") == "model_response"]
             row["review_model_calls"] = len(responses)
             row["review_total_tokens"] = sum((e.get("usage") or {}).get("total_tokens", 0) or 0 for e in responses)
+            row["review_usage"] = review_usage(responses)
         elif case["id"] in selected and (case_dir / "status.json").exists():
             row.update(read_json(case_dir / "status.json"))
         rows.append(row)
@@ -115,6 +116,8 @@ def report(data_dir: Path, run_dir: Path) -> dict:
                "profiles": profile_scores(evaluations), "by_project": {k: profile_scores(v) for k, v in groups.items()},
                "verification_verdicts": dict(stage_counts),
                "cases_with_verification_failures": sum(bool(r.get("verification_failures")) for r in rows),
+               "review_usage": {key: sum(r.get("review_usage", {}).get(key, 0) for r in rows)
+                                for key in ("prompt_tokens", "cached_prompt_tokens", "uncached_prompt_tokens", "completion_tokens")},
                "cases": rows,
                "configuration": run_manifest["configuration"]}
     write_json(run_dir / "summary.json", summary)
@@ -124,6 +127,9 @@ def report(data_dir: Path, run_dir: Path) -> dict:
              "| Profile | TP | FP | FN | Precision | Recall | F1 | F2 |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for name, m in summary["profiles"].items():
         lines.append(f"| {name} | {m['tp']} | {m['fp']} | {m['fn']} | {m['precision']:.1%} | {m['recall']:.1%} | {m['f1']:.1%} | {m['fbeta']:.1%} |")
+    usage = summary["review_usage"]
+    lines += ["", f"Review tokens: {usage['uncached_prompt_tokens']} uncached prompt, "
+              f"{usage['cached_prompt_tokens']} cached prompt, {usage['completion_tokens']} completion."]
     lines += ["", "## Cases (Core profile)", "", "| Case | Status | Precision | Recall | F1 |", "|---|---|---:|---:|---:|"]
     for row in rows:
         m = row.get("profiles", {}).get("core")
@@ -146,6 +152,20 @@ def report(data_dir: Path, run_dir: Path) -> dict:
             lines += [f"- {x['candidate']}" for x in row["false_positives"]] or ["- None"]
     (run_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return summary
+
+
+def review_usage(responses: list[dict]) -> dict:
+    """Sum review token usage, splitting prompt tokens by cache hit."""
+    totals = {"prompt_tokens": 0, "cached_prompt_tokens": 0, "completion_tokens": 0}
+    for event in responses:
+        usage = event.get("usage") or {}
+        details = usage.get("prompt_tokens_details") or {}
+        totals["prompt_tokens"] += usage.get("prompt_tokens") or 0
+        # Kimi reports cached_tokens at the top level; OpenAI nests it.
+        totals["cached_prompt_tokens"] += usage.get("cached_tokens") or details.get("cached_tokens") or 0
+        totals["completion_tokens"] += usage.get("completion_tokens") or 0
+    totals["uncached_prompt_tokens"] = totals["prompt_tokens"] - totals["cached_prompt_tokens"]
+    return totals
 
 
 async def run_benchmark(data_dir: Path, run_dir: Path, cases: list[dict], provider: str,

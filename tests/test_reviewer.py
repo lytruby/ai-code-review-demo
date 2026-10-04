@@ -22,10 +22,15 @@ class FakeCompletions:
     def create(self, **request):
         self.requests.append(request)
         system_content = request["messages"][0]["content"]
+        prompt_content = "\n".join(
+            str(message.get("content") or "")
+            for message in request["messages"]
+            if isinstance(message, dict)
+        )
         if (
             self.auto_empty_state_pass
-            and "Discovery pass:" in system_content
-            and "Discovery pass: correctness" not in system_content
+            and "Discovery pass:" in prompt_content
+            and "Discovery pass: correctness" not in prompt_content
         ):
             return response('{"candidates":[]}')
         if self.auto_identity_deduplication and "Stage: DEDUPLICATE" in system_content:
@@ -55,10 +60,10 @@ class FakeResponses:
 
     def create(self, **request):
         self.requests.append(request)
-        instructions = request["instructions"]
+        prompt_content = request["instructions"] + json.dumps(request["input"])
         if (
-            "Discovery pass:" in instructions
-            and "Discovery pass: correctness" not in instructions
+            "Discovery pass:" in prompt_content
+            and "Discovery pass: correctness" not in prompt_content
         ):
             return responses_response('{"candidates":[]}')
         return self.responses.pop(0)
@@ -807,6 +812,19 @@ def test_reviewer_verifies_candidates_in_separate_model_calls(tmp_path):
     assert len(completions.requests) == 8
     assert '"claim": "First claim"' in completions.requests[5]["messages"][1]["content"]
     assert '"claim": "Second claim"' in completions.requests[6]["messages"][1]["content"]
+    # Shared changes come before candidate text so the cached prefix is reused.
+    first_verify = completions.requests[5]["messages"]
+    second_verify = completions.requests[6]["messages"]
+    assert first_verify[0] == second_verify[0]
+    prefix = first_verify[1]["content"].split("Candidate:")[0]
+    assert "+first()" in prefix and "+second()" in prefix
+    assert second_verify[1]["content"].startswith(prefix)
+    discover_requests = completions.requests[:4]
+    discover_prefix = discover_requests[0]["messages"][1]["content"].split("Discovery pass:")[0]
+    assert "+first()" in discover_prefix
+    for request in discover_requests:
+        assert request["messages"][0] == discover_requests[0]["messages"][0]
+        assert request["messages"][1]["content"].startswith(discover_prefix)
     decisions = [
         event
         for event in reviewer.last_trace
@@ -857,10 +875,10 @@ def test_discover_merges_independent_correctness_and_state_passes(tmp_path):
         "Null dereference",
         "Concurrent lost update",
     ]
-    assert "Discovery pass: correctness" in completions.requests[0]["messages"][0]["content"]
-    assert "Discovery pass: state_and_concurrency" in completions.requests[1]["messages"][0]["content"]
-    assert "Discovery pass: behavioral_consistency" in completions.requests[2]["messages"][0]["content"]
-    assert "Discovery pass: tests_quality" in completions.requests[3]["messages"][0]["content"]
+    assert "Discovery pass: correctness" in completions.requests[0]["messages"][1]["content"]
+    assert "Discovery pass: state_and_concurrency" in completions.requests[1]["messages"][1]["content"]
+    assert "Discovery pass: behavioral_consistency" in completions.requests[2]["messages"][1]["content"]
+    assert "Discovery pass: tests_quality" in completions.requests[3]["messages"][1]["content"]
     discover_result = next(
         event
         for event in reviewer.last_trace
@@ -1731,3 +1749,26 @@ def test_verify_native_calls_take_precedence_over_textual_imitation(tmp_path):
 )
 def test_tool_turn_output_accepts_fenced_json(output):
     assert OpenAIReviewer._parse_json_object(output) == {"status": "complete"}
+
+
+def test_tool_turn_output_accepts_prose_before_fenced_json():
+    output = 'The claim holds.\n\n```json\n{"status": "complete"}\n```'
+    assert OpenAIReviewer._parse_json_object(output) == {"status": "complete"}
+
+
+def test_verify_finalizes_immediately_when_tool_budget_is_spent(tmp_path):
+    from src.reviewer import MAX_TOOL_CALLS
+
+    reviewer, completions = verification_reviewer(tmp_path, [
+        response(verification_decision(verdict="inconclusive")),
+    ])
+    state = ReviewState(stage="verify", tool_calls=MAX_TOOL_CALLS)
+    issues, decision = reviewer._verify_candidate(
+        "File: example.py\nPatch:\n+changed()", verification_candidate(), 0, state, [], 0,
+    )
+    assert issues == []
+    assert decision["verdict"] == "inconclusive"
+    assert len(completions.requests) == 1
+    request = completions.requests[0]
+    assert "tools" not in request
+    assert "budget is exhausted" in request["messages"][-1]["content"]
