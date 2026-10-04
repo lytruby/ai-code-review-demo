@@ -2,7 +2,10 @@ from dataclasses import asdict, dataclass, field
 import json
 import os
 from pathlib import Path
+import sys
+import threading
 import time
+from types import SimpleNamespace
 from typing import Literal
 
 from dotenv import load_dotenv
@@ -22,7 +25,8 @@ from src.models import (
     ReviewResult,
     review_issue_from_dict,
 )
-from src.tools import READ_FILE_TOOL, SEARCH_CODE_TOOL, execute_tool
+from src.tools import READ_FILE_TOOL, SEARCH_CODE_TOOL
+from src.tool_gateway import ToolGateway, ToolProposal
 
 MAX_TOOL_CALLS = 40
 MAX_REQUIRED_FACTS_PER_CANDIDATE = 2
@@ -233,6 +237,7 @@ such as {"query": ...} or {"path": ...} as ordinary JSON content.
 - revise: there is a real issue, but its description or suggestion needs repair;
 - rejected: the candidate is contradicted, speculative, non-actionable, or only a
   future maintenance concern.
+- inconclusive: available evidence is insufficient to decide within the budget.
 
 Judge the candidate's smallest concrete defect separately from any overstated
 scope, severity, affected population, secondary impact, or suggested fix. If
@@ -255,7 +260,7 @@ valid JSON with exactly one decision whose candidate_index is 0:
   "decisions": [
     {
       "candidate_index": 0,
-      "verdict": "keep | revise | rejected",
+      "verdict": "keep | revise | rejected | inconclusive",
       "basis": "diff | repository",
       "reason": "Why this verdict is supported",
       "supporting_evidence": [
@@ -276,7 +281,7 @@ valid JSON with exactly one decision whose candidate_index is 0:
   ]
 }
 
-For rejected decisions, issue must be null. For keep and revise decisions, issue
+For rejected and inconclusive decisions, issue must be null. For keep and revise decisions, issue
 must contain the verified issue and supporting_evidence must contain exact
 source excerpts supporting every independently checkable behavioral assertion
 in the final description. Do not introduce a new repository fact in a revised
@@ -287,6 +292,9 @@ decided entirely from the supplied diff. A diff-based reason must not assert
 facts about definitions, call sites, inheritance, configuration, or runtime
 state outside the diff. Use basis=repository when repository context is needed;
 you must successfully call search_code or read_file before returning it.
+Always use the Required decision basis supplied by the workflow. If that basis
+cannot support a keep or revise decision, return inconclusive with issue=null;
+do not switch basis to bypass a required repository fact.
 """
 
 ACQUIRE_CONTEXT_PROMPT = """\
@@ -297,6 +305,9 @@ calls; do not judge the candidate or return a verification decision. Search
 results alone do not resolve a fact: read the relevant source. If an exact
 search has no matches, try a better exact symbol/text query or read a known
 file around the relevant location. The workflow enforces a finite tool budget.
+If the needed context cannot be obtained, stop with JSON
+{"status":"inconclusive","reason":"Why context is insufficient"}.
+This stops evidence collection; it is not a finding that no issue exists.
 """
 
 FINALIZE_PROMPT = """\
@@ -332,6 +343,7 @@ class ReviewState:
     model_turns: int = 0
     tool_calls: int = 0
     api_attempts: int = 0
+    tool_gateway: ToolGateway | None = field(default=None, repr=False)
 
 
 class Reviewer:
@@ -340,28 +352,50 @@ class Reviewer:
 
 
 class OpenAIReviewer(Reviewer):
-    def __init__(self, client=None, repository_root=None, model=None):
+    def __init__(self, client=None, repository_root=None, model=None, provider=None):
+        configured_model = model or os.environ.get("LLM_MODEL")
+        self.provider = self._resolve_provider(provider, configured_model)
+        self.request_timeout = float(os.environ.get("LLM_TIMEOUT", "120"))
+        self.progress_interval = float(
+            os.environ.get("LLM_PROGRESS_INTERVAL", "30")
+        )
+        if self.progress_interval < 0:
+            raise ValueError("LLM_PROGRESS_INTERVAL must be non-negative")
+
         if client is None:
-            moonshot_key = os.environ.get("MOONSHOT_API_KEY")
-            api_key = moonshot_key or os.environ.get("OPENAI_API_KEY")
+            if self.provider == "kimi":
+                api_key = os.environ.get("MOONSHOT_API_KEY")
+                key_name = "MOONSHOT_API_KEY"
+            else:
+                api_key = os.environ.get("OPENAI_API_KEY")
+                key_name = "OPENAI_API_KEY"
             if not api_key:
-                raise ValueError("Set MOONSHOT_API_KEY or OPENAI_API_KEY")
+                raise ValueError(f"Set {key_name} for provider={self.provider}")
 
             client_options = {"api_key": api_key}
-            base_url = os.environ.get("LLM_BASE_URL")
-            if moonshot_key:
-                base_url = base_url or "https://api.moonshot.cn/v1"
+            if self.provider == "kimi":
+                base_url = (
+                    os.environ.get("KIMI_BASE_URL")
+                    or os.environ.get("LLM_BASE_URL")
+                    or "https://api.moonshot.cn/v1"
+                )
+            else:
+                base_url = os.environ.get("OPENAI_BASE_URL")
             if base_url:
                 client_options["base_url"] = base_url
-            client_options["timeout"] = float(os.environ.get("LLM_TIMEOUT", "120"))
+            client_options["timeout"] = self.request_timeout
             client_options["max_retries"] = int(os.environ.get("LLM_MAX_RETRIES", "0"))
             client = OpenAI(**client_options)
 
         self.client = client
-        default_model = (
-            "kimi-k2.6" if os.environ.get("MOONSHOT_API_KEY") else "gpt-5.6-luna"
+        if self.provider == "kimi":
+            default_model = os.environ.get("KIMI_MODEL", "kimi-k3")
+        else:
+            default_model = os.environ.get("OPENAI_MODEL", "gpt-5.6")
+        self.model = configured_model or default_model
+        self.use_responses_api = (
+            self.provider == "openai" and self.model.startswith("gpt-5.6")
         )
-        self.model = model or os.environ.get("LLM_MODEL", default_model)
         self.max_completion_tokens = int(
             os.environ.get("LLM_MAX_COMPLETION_TOKENS", "2048")
         )
@@ -375,17 +409,49 @@ class OpenAIReviewer(Reviewer):
         self.kimi_thinking = os.environ.get("KIMI_THINKING", "disabled")
         if self.kimi_thinking not in {"enabled", "disabled"}:
             raise ValueError("KIMI_THINKING must be enabled or disabled")
-        self.reasoning_effort = os.environ.get("LLM_REASONING_EFFORT", "low")
+        default_reasoning_effort = (
+            "medium" if self.model.startswith("gpt-5.6") else "low"
+        )
+        self.reasoning_effort = os.environ.get(
+            "LLM_REASONING_EFFORT", default_reasoning_effort
+        )
         if self.model.startswith("kimi-k3") and self.reasoning_effort not in {
             "low",
             "high",
             "max",
         }:
             raise ValueError("LLM_REASONING_EFFORT must be low, high, or max")
+        if self.model.startswith("gpt-5.6") and self.reasoning_effort not in {
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        }:
+            raise ValueError(
+                "GPT-5.6 LLM_REASONING_EFFORT must be none, low, medium, high, "
+                "xhigh, or max"
+            )
         workspace = repository_root or os.environ.get("GITHUB_WORKSPACE", Path.cwd())
         self.repository_root = Path(workspace).resolve()
         self.last_trace: list[dict] = []
         self.last_state: ReviewState | None = None
+        self._responses_sessions: dict[int, dict] = {}
+
+    @staticmethod
+    def _resolve_provider(provider: str | None, model: str | None) -> str:
+        resolved = (provider or os.environ.get("LLM_PROVIDER") or "").lower()
+        if not resolved:
+            if model:
+                resolved = "kimi" if model.startswith("kimi-") else "openai"
+            elif os.environ.get("MOONSHOT_API_KEY"):
+                resolved = "kimi"
+            else:
+                resolved = "openai"
+        if resolved not in {"kimi", "openai"}:
+            raise ValueError("provider must be kimi or openai")
+        return resolved
 
     def review(self, changes) -> ReviewResult:
         state = ReviewState()
@@ -401,6 +467,22 @@ class OpenAIReviewer(Reviewer):
         state.verified_issues = self._verify(code_changes, state)
         state.stage = "finalize"
         summary = self._finalize(state)
+        protocol_failures = sum(
+            e.get("type") == "candidate_result" and e.get("failure_kind") == "tool_protocol_error"
+            for e in state.trace
+        )
+        inconclusive_count = sum(
+            e.get("type") == "candidate_result" and e.get("verdict") == "inconclusive"
+            for e in state.trace
+        )
+        if inconclusive_count:
+            warning = (
+                f"Context insufficient: {inconclusive_count} candidate(s) remain inconclusive; "
+                f"{len(state.verified_issues)} verified issue(s). "
+            )
+            if protocol_failures:
+                warning += f"{protocol_failures} candidate(s) stopped with tool_protocol_error. "
+            summary = warning + (summary if state.verified_issues else "This is not a no-issues conclusion.")
         state.stage = "complete"
 
         return ReviewResult(
@@ -663,6 +745,17 @@ class OpenAIReviewer(Reviewer):
                     "reason": "Required repository facts were not resolved within the context budget",
                     "unresolved_fact_indices": unresolved_facts,
                 }
+                protocol_error = next((c for c in repository_context if c.get("failure_kind") == "tool_protocol_error"), None)
+                if protocol_error:
+                    decision.update(
+                        failure_kind="tool_protocol_error",
+                        reason="Tool protocol failed after correction; context is insufficient to decide this candidate",
+                        last_validation_error=protocol_error["last_validation_error"],
+                    )
+                else:
+                    stopped = next((c for c in repository_context if c.get("stop_reason")), None)
+                    if stopped:
+                        decision["reason"] = f"Context insufficient: {stopped['stop_reason']}"
                 state.trace.append(
                     {
                         "type": "candidate_result",
@@ -734,6 +827,10 @@ class OpenAIReviewer(Reviewer):
             MAX_VERIFY_TURNS_PER_CANDIDATE
             + MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE
         )
+        last_validation_error = None
+        text_tool_corrections = 0
+        protocol_retry_pending = False
+        protocol_failed = False
         for turn_index in range(total_verify_turns):
             is_finalization_turn = turn_index >= MAX_VERIFY_TURNS_PER_CANDIDATE
             if is_finalization_turn:
@@ -742,10 +839,11 @@ class OpenAIReviewer(Reviewer):
                     state,
                     "Verification tool and exploration budget is exhausted. "
                     "Return the final decision now using only evidence already "
-                    "available. Do not request another tool. If the diff alone "
-                    "supports the issue, use basis=diff and include only diff "
-                    "supporting_evidence. If the claim is not established, "
-                    "return rejected or inconclusive.",
+                    "available. Do not request another tool. "
+                    f"Keep basis={expected_basis}. Keep/revise still requires "
+                    "valid supporting evidence for that basis. If evidence is "
+                    "insufficient, return inconclusive with issue=null. Return "
+                    "exactly one decision with candidate_index=0.",
                 )
 
             message = self._request(
@@ -757,11 +855,37 @@ class OpenAIReviewer(Reviewer):
             self._append_assistant(messages, message)
 
             if tool_calls:
+                protocol_retry_pending = False
                 successful_tool_calls += self._execute_tool_calls(
                     messages,
                     tool_calls,
                     state,
                     candidate_index=candidate_index,
+                    tools_allowed=not is_finalization_turn,
+                )
+                if is_finalization_turn:
+                    last_validation_error = "Tools are disabled during finalization"
+                continue
+
+            # Detect protocol mistakes only for feedback, never for execution.
+            if self._has_text_tool_proposal(message.content or ""):
+                last_validation_error = "Textual tool arguments are not executable proposals"
+                retry_allowed = (
+                    turn_index + 1 < MAX_VERIFY_TURNS_PER_CANDIDATE
+                    and text_tool_corrections == 0 and state.tool_calls < MAX_TOOL_CALLS
+                )
+                self._record_tool_protocol_error(state, candidate_index, None, retry_allowed)
+                if not retry_allowed:
+                    protocol_failed = True
+                    break
+                text_tool_corrections += 1
+                protocol_retry_pending = True
+                self._append_feedback(
+                    messages, state,
+                    self._tool_protocol_feedback() +
+                    " Alternatively, return a normal verification decision based only on existing evidence; "
+                    "if context is insufficient, return one inconclusive decision "
+                    f"with basis={expected_basis} and issue=null. "
                 )
                 continue
 
@@ -778,14 +902,12 @@ class OpenAIReviewer(Reviewer):
                     require_supporting_evidence=True,
                 )
             except ValueError as error:
-                feedback = f"Invalid VERIFY output: {error}"
-                if self._looks_like_tool_arguments(message.content or ""):
-                    feedback += (
-                        ". You returned tool arguments as ordinary content. "
-                        "Invoke search_code or read_file through an actual "
-                        "function tool call now; do not return argument JSON."
-                    )
-                self._append_feedback(messages, state, feedback)
+                last_validation_error = str(error)
+                if protocol_retry_pending:
+                    protocol_failed = True
+                    self._record_tool_protocol_error(state, candidate_index, None, False)
+                    break
+                self._append_feedback(messages, state, f"Invalid VERIFY output: {error}")
                 continue
 
             decision = dict(local_decisions[0])
@@ -800,9 +922,21 @@ class OpenAIReviewer(Reviewer):
             )
             return verified, decision
 
-        raise ValueError(
-            f"VERIFY candidate {candidate_index} did not finish within its turn limit"
-        )
+        decision = {
+            "candidate_index": candidate_index,
+            "verdict": "inconclusive",
+            "basis": expected_basis,
+            "reason": "Verification did not produce a valid decision within its protocol or turn budget",
+            "failure_kind": "tool_protocol_error" if protocol_failed or protocol_retry_pending else "verification_turn_limit",
+            "last_validation_error": last_validation_error,
+        }
+        if decision["failure_kind"] == "tool_protocol_error":
+            decision["reason"] = "Tool protocol failed; no additional context was obtained, so this candidate is inconclusive"
+        state.trace.append({
+            "type": "candidate_result", "stage": "verify", **decision,
+            "successful_tool_calls": successful_tool_calls,
+        })
+        return [], decision
 
     def _acquire_required_context(
         self,
@@ -882,6 +1016,10 @@ class OpenAIReviewer(Reviewer):
                 unresolved_facts.append(fact_index)
 
             acquired_context.append(fact_context)
+            if fact_context.get("failure_kind") == "tool_protocol_error":
+                # Stop collecting evidence for this candidate, including later facts.
+                unresolved_facts.extend(range(fact_index + 1, len(candidate.required_facts)))
+                break
 
         return acquired_context, successful_tool_calls, unresolved_facts
 
@@ -911,7 +1049,9 @@ class OpenAIReviewer(Reviewer):
             },
         ]
 
-        for _ in range(MAX_CONTEXT_TURNS_PER_FACT):
+        protocol_retry_pending = False
+        protocol_retry_used = False
+        for turn_index in range(MAX_CONTEXT_TURNS_PER_FACT):
             remaining = MAX_CONTEXT_TOOL_CALLS_PER_FACT - fact_context["tool_calls"]
             if remaining <= 0 or state.tool_calls >= MAX_TOOL_CALLS:
                 break
@@ -919,6 +1059,23 @@ class OpenAIReviewer(Reviewer):
             tool_calls = message.tool_calls or []
             self._append_assistant(messages, message)
             if not tool_calls:
+                stop_reason = self._context_stop_reason(message.content or "")
+                if stop_reason:
+                    fact_context["stop_reason"] = stop_reason
+                    return successful_tool_calls
+                if self._has_text_tool_proposal(message.content or "") or protocol_retry_pending:
+                    retry_allowed = not protocol_retry_used and turn_index + 1 < MAX_CONTEXT_TURNS_PER_FACT
+                    self._record_tool_protocol_error(state, candidate_index, fact_index, retry_allowed)
+                    if not retry_allowed:
+                        fact_context.update(failure_kind="tool_protocol_error", last_validation_error="No native tool call or valid inconclusive termination after protocol correction")
+                        return successful_tool_calls
+                    protocol_retry_used = True
+                    protocol_retry_pending = True
+                    self._append_feedback(
+                        messages, state, self._tool_protocol_feedback() +
+                        ' Alternatively, stop with {"status":"inconclusive","reason":"Context is insufficient because ..."}.',
+                    )
+                    continue
                 self._append_feedback(
                     messages,
                     state,
@@ -926,6 +1083,7 @@ class OpenAIReviewer(Reviewer):
                 )
                 continue
 
+            protocol_retry_pending = False
             for tool_call in tool_calls[:remaining]:
                 output, succeeded = self._execute_workflow_tool(
                     tool_name=tool_call.function.name,
@@ -951,6 +1109,8 @@ class OpenAIReviewer(Reviewer):
                 if fact_context["resolved"]:
                     return successful_tool_calls
 
+        if protocol_retry_pending:
+            fact_context.update(failure_kind="tool_protocol_error", last_validation_error="Protocol retry could not finish within the context budget")
         return successful_tool_calls
 
     def _execute_workflow_tool(
@@ -963,17 +1123,10 @@ class OpenAIReviewer(Reviewer):
         origin: str = "workflow",
         tool_call_id: str | None = None,
     ) -> tuple[str, bool]:
-        if state.tool_calls >= MAX_TOOL_CALLS:
-            tool_output = json.dumps(
-                {"ok": False, "error": "Tool call limit reached"}
-            )
-        else:
-            tool_output = execute_tool(
-                tool_name=tool_name,
-                arguments=arguments,
-                repository_root=self.repository_root,
-            )
-            state.tool_calls += 1
+        tool_output = self._dispatch_tool(
+            ToolProposal(tool_name, arguments, tool_call_id), state,
+            candidate_index=candidate_index, source=origin,
+        )
 
         try:
             succeeded = json.loads(tool_output).get("ok") is True
@@ -982,7 +1135,7 @@ class OpenAIReviewer(Reviewer):
         state.trace.append(
             {
                 "type": "tool_result",
-                "stage": "acquire_context",
+                "stage": state.stage,
                 "candidate_index": candidate_index,
                 "required_fact_index": fact_index,
                 **({"tool_call_id": tool_call_id} if tool_call_id else {}),
@@ -992,6 +1145,26 @@ class OpenAIReviewer(Reviewer):
             }
         )
         return tool_output, succeeded
+
+    def _dispatch_tool(
+        self, proposal: ToolProposal, state: ReviewState, *,
+        candidate_index: int, source: str, tools_allowed: bool = True,
+    ) -> str:
+        if state.tool_gateway is None:
+            state.tool_gateway = ToolGateway(
+                self.repository_root, max_calls=max(0, MAX_TOOL_CALLS - state.tool_calls),
+            )
+        outcome = state.tool_gateway.execute(
+            proposal, source=source, stage=state.stage, tools_allowed=tools_allowed,
+        )
+        state.tool_calls += int(outcome.charged)
+        state.trace.append({
+            "type": "tool_gateway_decision", "stage": state.stage,
+            "candidate_index": candidate_index, "origin": source,
+            "name": proposal.name, "tool_call_id": proposal.call_id,
+            "allowed": outcome.allowed, "code": outcome.code,
+        })
+        return outcome.output
 
     def _finalize(self, state: ReviewState) -> str:
         issues = [asdict(issue) for issue in state.verified_issues]
@@ -1027,62 +1200,162 @@ class OpenAIReviewer(Reviewer):
         if state.model_turns >= MAX_MODEL_TURNS:
             raise ValueError("AI review reached the workflow turn limit")
 
-        request = {
-            "model": self.model,
-            "messages": list(messages),
-            "max_completion_tokens": (
-                self.discover_max_completion_tokens
-                if state.stage == "discover"
-                else self.max_completion_tokens
-            ),
-            "response_format": {"type": "json_object"},
-        }
-        if self.model.startswith("kimi-k3"):
-            request["reasoning_effort"] = self.reasoning_effort
-        elif self.model.startswith("kimi-k2"):
-            request["extra_body"] = {"thinking": {"type": self.kimi_thinking}}
-        if allow_tools and state.tool_calls < MAX_TOOL_CALLS:
-            request["tools"] = [
-                self._chat_tool(READ_FILE_TOOL),
-                self._chat_tool(SEARCH_CODE_TOOL),
+        max_tokens = (
+            self.discover_max_completion_tokens
+            if state.stage == "discover"
+            else self.max_completion_tokens
+        )
+        if self.use_responses_api:
+            session = self._responses_sessions.get(id(messages))
+            if session is not None and session["messages"] is not messages:
+                session = None
+            if session is None:
+                new_messages = messages[1:]
+            else:
+                new_messages = [
+                    message
+                    for message in messages[session["sent_message_count"] :]
+                    if message.get("role") != "assistant"
+                ]
+            response_input = [
+                {
+                    "role": "user",
+                    "content": (
+                        "Output protocol: any textual response must be valid JSON. "
+                        "When tools are available and context is needed, emit a "
+                        "function call instead of textual tool arguments."
+                    ),
+                },
+                *self._responses_input(new_messages),
             ]
+            request = {
+                "model": self.model,
+                "instructions": messages[0]["content"],
+                "input": response_input,
+                "max_output_tokens": max_tokens,
+                "text": {"format": {"type": "json_object"}},
+                "reasoning": {"effort": self.reasoning_effort},
+            }
+            if session is not None:
+                request["previous_response_id"] = session["previous_response_id"]
+            if allow_tools and state.tool_calls < MAX_TOOL_CALLS:
+                request["tools"] = [READ_FILE_TOOL, SEARCH_CODE_TOOL]
+        else:
+            request = {
+                "model": self.model,
+                "messages": list(messages),
+                "max_completion_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+            }
+            if self.model.startswith("kimi-k3"):
+                request["reasoning_effort"] = self.reasoning_effort
+            elif self.model.startswith("kimi-k2"):
+                request["extra_body"] = {"thinking": {"type": self.kimi_thinking}}
+            if allow_tools and state.tool_calls < MAX_TOOL_CALLS:
+                request["tools"] = [
+                    self._chat_tool(READ_FILE_TOOL),
+                    self._chat_tool(SEARCH_CODE_TOOL),
+                ]
 
         response = None
         for retry_index in range(self.max_transient_retries + 1):
             state.api_attempts += 1
+            attempt = retry_index + 1
+            total_attempts = self.max_transient_retries + 1
+            started_at = time.monotonic()
+            print(
+                f"model request stage={state.stage} "
+                f"turn={state.model_turns + 1} attempt={attempt}/{total_attempts} "
+                f"timeout={self.request_timeout:g}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            heartbeat_stop = threading.Event()
+            if self.progress_interval > 0:
+                threading.Thread(
+                    target=self._report_request_progress,
+                    args=(
+                        heartbeat_stop,
+                        state.stage,
+                        state.model_turns + 1,
+                        attempt,
+                        started_at,
+                    ),
+                    daemon=True,
+                ).start()
             try:
-                response = self.client.chat.completions.create(**request)
+                if self.use_responses_api:
+                    response = self.client.responses.create(**request)
+                else:
+                    response = self.client.chat.completions.create(**request)
+                elapsed = time.monotonic() - started_at
+                print(
+                    f"model response stage={state.stage} "
+                    f"turn={state.model_turns + 1} attempt={attempt} "
+                    f"elapsed={elapsed:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 break
             except TRANSIENT_API_ERRORS as error:
+                elapsed = time.monotonic() - started_at
                 state.trace.append(
                     {
                         "type": "model_request_error",
                         "stage": state.stage,
-                        "attempt": retry_index + 1,
+                        "attempt": attempt,
                         "will_retry": retry_index < self.max_transient_retries,
                         "error_type": type(error).__name__,
                         "status_code": getattr(error, "status_code", None),
                         "error": str(error)[:1000],
+                        "elapsed_seconds": round(elapsed, 3),
                     }
+                )
+                print(
+                    f"model request failed stage={state.stage} "
+                    f"turn={state.model_turns + 1} attempt={attempt} "
+                    f"elapsed={elapsed:.1f}s error={type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
                 )
                 if retry_index >= self.max_transient_retries:
                     raise
                 delay = self.retry_backoff_seconds * (2**retry_index)
                 if delay > 0:
+                    print(
+                        f"retrying model request in {delay:g}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     time.sleep(delay)
+            finally:
+                heartbeat_stop.set()
 
         if response is None:
             raise RuntimeError("Model request completed without a response")
+        if self.use_responses_api:
+            response_id = getattr(response, "id", None)
+            if not response_id:
+                raise RuntimeError("OpenAI Responses result is missing an id")
+            self._responses_sessions[id(messages)] = {
+                "messages": messages,
+                "previous_response_id": response_id,
+                "sent_message_count": len(messages),
+            }
         state.model_turns += 1
-        choice = response.choices[0]
-        message = choice.message
+        if self.use_responses_api:
+            message, finish_reason = self._responses_message(response)
+        else:
+            choice = response.choices[0]
+            message = choice.message
+            finish_reason = getattr(choice, "finish_reason", None)
         tool_calls = message.tool_calls or []
         state.trace.append(
             {
                 "type": "model_response",
                 "stage": state.stage,
                 "turn": state.model_turns,
-                "finish_reason": getattr(choice, "finish_reason", None),
+                "finish_reason": finish_reason,
                 "usage": self._serialize_usage(getattr(response, "usage", None)),
                 "content": message.content,
                 "tool_calls": [
@@ -1096,6 +1369,69 @@ class OpenAIReviewer(Reviewer):
             }
         )
         return message
+
+    @staticmethod
+    def _responses_input(messages: list[dict]) -> list[dict]:
+        response_input = []
+        for message in messages:
+            role = message.get("role")
+            if role == "tool":
+                response_input.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": message["tool_call_id"],
+                        "output": message.get("content", ""),
+                    }
+                )
+            elif role in {"user", "assistant"}:
+                response_input.append(
+                    {"role": role, "content": message.get("content") or ""}
+                )
+        return response_input
+
+    @staticmethod
+    def _responses_message(response):
+        tool_calls = []
+        for item in response.output:
+            item_type = item.get("type") if isinstance(item, dict) else item.type
+            if item_type != "function_call":
+                continue
+            get_value = item.get if isinstance(item, dict) else lambda key: getattr(item, key)
+            tool_calls.append(
+                SimpleNamespace(
+                    id=get_value("call_id"),
+                    function=SimpleNamespace(
+                        name=get_value("name"),
+                        arguments=get_value("arguments"),
+                    ),
+                )
+            )
+        message = SimpleNamespace(
+            content=getattr(response, "output_text", None) or None,
+            tool_calls=tool_calls,
+        )
+        finish_reason = getattr(response, "status", None)
+        if getattr(response, "incomplete_details", None) is not None:
+            details = response.incomplete_details
+            finish_reason = getattr(details, "reason", None) or finish_reason
+        return message, finish_reason
+
+    def _report_request_progress(
+        self,
+        stop: threading.Event,
+        stage: str,
+        turn: int,
+        attempt: int,
+        started_at: float,
+    ) -> None:
+        while not stop.wait(self.progress_interval):
+            elapsed = time.monotonic() - started_at
+            print(
+                f"waiting for model stage={stage} turn={turn} attempt={attempt} "
+                f"elapsed={elapsed:.0f}s timeout={self.request_timeout:g}s",
+                file=sys.stderr,
+                flush=True,
+            )
 
     @staticmethod
     def _serialize_usage(usage) -> dict | None:
@@ -1120,20 +1456,15 @@ class OpenAIReviewer(Reviewer):
         tool_calls,
         state: ReviewState,
         candidate_index: int,
+        tools_allowed: bool = True,
     ) -> int:
         successful_tool_calls = 0
         for tool_call in tool_calls:
-            if state.tool_calls >= MAX_TOOL_CALLS:
-                tool_output = json.dumps(
-                    {"ok": False, "error": "Tool call limit reached"}
-                )
-            else:
-                tool_output = execute_tool(
-                    tool_name=tool_call.function.name,
-                    arguments=tool_call.function.arguments,
-                    repository_root=self.repository_root,
-                )
-                state.tool_calls += 1
+            tool_output = self._dispatch_tool(
+                ToolProposal(tool_call.function.name, tool_call.function.arguments, tool_call.id),
+                state, candidate_index=candidate_index, source="model",
+                tools_allowed=tools_allowed,
+            )
 
             try:
                 tool_succeeded = json.loads(tool_output).get("ok") is True
@@ -1197,6 +1528,13 @@ class OpenAIReviewer(Reviewer):
         if not message.content and not tool_calls:
             return
 
+        # Kimi K3 requires the original assistant message, including
+        # reasoning_content, when continuing after a tool result.
+        # exclude_unset avoids adding SDK defaults absent from the API response.
+        if callable(getattr(message, "model_dump", None)):
+            messages.append(message.model_dump(exclude_unset=True))
+            return
+
         assistant_message = {"role": "assistant", "content": message.content}
         if tool_calls:
             assistant_message["tool_calls"] = [
@@ -1230,18 +1568,71 @@ class OpenAIReviewer(Reviewer):
         return data
 
     @staticmethod
-    def _looks_like_tool_arguments(output_text: str) -> bool:
+    def _tool_protocol_feedback() -> str:
+        return (
+            "tool_protocol_error: Your ordinary content describes tool calls, but the API "
+            "message has no native tool_calls. Nothing was executed from that response. "
+            "No new context was obtained from it. Return native function tool calls, "
+            "not a JSON imitation inside content. This correction is allowed once."
+        )
+
+    @staticmethod
+    def _record_tool_protocol_error(state, candidate_index, fact_index, retry_allowed):
+        state.trace.append({
+            "type": "tool_protocol_error", "stage": state.stage,
+            "candidate_index": candidate_index, "required_fact_index": fact_index,
+            "turn": state.model_turns, "retry_allowed": retry_allowed,
+            "new_context_obtained": False,
+        })
+
+    @staticmethod
+    def _context_stop_reason(output_text: str) -> str | None:
+        try:
+            data = json.loads(output_text)
+        except (json.JSONDecodeError, RecursionError):
+            return None
+        if (isinstance(data, dict) and set(data) == {"status", "reason"}
+                and data.get("status") == "inconclusive"
+                and isinstance(data.get("reason"), str) and data["reason"].strip()):
+            return data["reason"]
+        return None
+
+    @classmethod
+    def _has_text_tool_proposal(cls, output_text: str) -> bool:
+        """Detect protocol errors only; never decode them into executable calls."""
+        try:
+            data = json.loads(output_text)
+        except (json.JSONDecodeError, RecursionError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        # Includes the observed malformed {"tool_calls": 1} envelope.
+        if data.get("tool_calls") or data.get("function_call"):
+            return True
+        if "decisions" in data:
+            return False
+        if isinstance(data.get("name"), str) and "arguments" in data:
+            return True
+        if isinstance(data.get("function"), dict) and "arguments" in data["function"]:
+            return True
+        return cls._text_tool_name(output_text) is not None
+
+    @staticmethod
+    def _text_tool_name(output_text: str) -> str | None:
         try:
             data = json.loads(output_text)
         except json.JSONDecodeError:
-            return False
+            return None
         if not isinstance(data, dict) or "decisions" in data:
-            return False
+            return None
         keys = set(data)
-        tool_argument_keys = {"query", "path", "line", "context_lines"}
-        return bool(keys) and keys <= tool_argument_keys and bool(
-            keys & {"query", "path"}
-        )
+        if keys <= {"query", "path"} and isinstance(data.get("query"), str):
+            if data.get("path") is None or isinstance(data["path"], str):
+                return "search_code"
+        if keys <= {"path", "line", "context_lines"} and isinstance(data.get("path"), str):
+            if all(data.get(k) is None or type(data[k]) is int for k in ("line", "context_lines")):
+                return "read_file"
+        return None
 
     @classmethod
     def _parse_deduplication_groups(
@@ -1529,8 +1920,8 @@ class OpenAIReviewer(Reviewer):
             seen.add(index)
 
             verdict = raw_decision.get("verdict")
-            if verdict not in {"keep", "revise", "rejected", "drop"}:
-                raise ValueError("verdict must be keep, revise, or rejected")
+            if verdict not in {"keep", "revise", "rejected", "drop", "inconclusive"}:
+                raise ValueError("verdict must be keep, revise, rejected, or inconclusive")
             basis = raw_decision.get("basis")
             if basis not in {"diff", "repository"}:
                 raise ValueError("basis must be diff or repository")
@@ -1550,9 +1941,9 @@ class OpenAIReviewer(Reviewer):
                 raise ValueError("verification reason must be a string")
 
             raw_issue = raw_decision.get("issue")
-            if verdict in {"rejected", "drop"}:
+            if verdict in {"rejected", "drop", "inconclusive"}:
                 if raw_issue is not None:
-                    raise ValueError("rejected decisions must have a null issue")
+                    raise ValueError("rejected and inconclusive decisions must have a null issue")
             else:
                 supporting_evidence = raw_decision.get("supporting_evidence")
                 if require_supporting_evidence:

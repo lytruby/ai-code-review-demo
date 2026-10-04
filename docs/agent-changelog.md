@@ -1865,6 +1865,147 @@ VERIFY prompt 回归断言覆盖核心缺陷拆分、`revise` 优先和 intended
 79 tests passed
 ```
 
+## 2026-08-10：Explicit Kimi/OpenAI provider routing
+
+### 目标
+
+在不改变 Agent workflow、prompt 和 scorer 的前提下，用同一组 locked cases 对比
+Kimi K3 与 OpenAI GPT 模型。
+
+### 配置修复
+
+此前 `--provider` 只控制输出目录；当 `.env` 同时存在 Moonshot review key 和
+OpenAI judge key 时，Reviewer 总是优先选择 Moonshot。现在 runner 将 provider
+显式传给 Reviewer：
+
+1. `kimi` 使用 `MOONSHOT_API_KEY` 和 Moonshot endpoint。
+2. `openai` 使用 `OPENAI_API_KEY` 和 OpenAI 默认 endpoint。
+3. 两个 key 同时存在时不会串用 provider。
+4. OpenAI 默认模型为 `gpt-5.6`，默认 reasoning effort 为 `medium`。
+5. GPT-5.6 的 reasoning effort 校验支持 `none/low/medium/high/xhigh/max`；Kimi
+   K3 继续保持 `low/high/max`。
+
+### 对照边界
+
+Kimi 使用 Chat Completions；OpenAI GPT-5.6 使用 Responses API，因为 GPT-5.6 的
+Chat Completions endpoint 不支持 reasoning effort 与 function tools 同时使用。两条
+transport 共享现有 function tools、结构化 JSON 输出、prompt 和所有 workflow 预算。
+对照实验因此保持 Agent 行为一致，但不能声称底层 API surface 完全相同。
+
+### 测试
+
+- 两个 API key 同时存在时，provider 选择正确的 key 和 endpoint。
+- Runner 将 `--provider` 显式传给 Reviewer。
+- GPT-5.6 请求使用默认 `medium` reasoning effort，且不携带 Kimi 专属参数。
+
+```text
+82 tests passed
+```
+
+## 2026-08-10：Visible model-request progress
+
+### 问题
+
+`LLM_TIMEOUT=300` 是每次 API attempt 的 timeout；再加 2 次显式重试后，同一个
+workflow turn 最坏可等待接近 15 分钟。同步 HTTP 请求等待响应头期间没有终端输出，
+用户无法区分长推理、网络挂起和程序死锁。
+
+### 修改
+
+1. 每次请求开始打印 stage、turn、attempt、总 attempts 和单次 timeout。
+2. 默认每 30 秒打印一次 heartbeat，可通过 `LLM_PROGRESS_INTERVAL` 调整或设为 0
+   关闭。
+3. 请求完成打印 elapsed time；临时错误打印错误类型、elapsed time 和重试等待。
+4. `model_request_error` trajectory 增加 `elapsed_seconds`。
+
+修改只增加 observability，不改变请求、重试次数、模型预算或 workflow 决策。
+
+## 2026-08-10：OpenAI strict function schema compatibility
+
+### 现象
+
+GPT-5.6 能完成 DISCOVER 和 DEDUPLICATE，但第一次携带 tools 的 VERIFY 请求返回
+HTTP 400：strict function schema 的 `required` 必须列出 `properties` 中所有字段。
+Kimi 接受的传统 optional-field schema 因此不能直接用于 OpenAI。
+
+### 修改
+
+1. `read_file` 的 `path/line/context_lines` 全部列入 `required`；后两者允许
+   `integer | null`。
+2. `search_code` 的 `query/path` 全部列入 `required`；`path` 允许
+   `string | null`。
+3. 执行层继续把 null 解释为未指定，保留完整文件读取、默认 context window 和全仓库
+   搜索的原有语义。
+4. Kimi 与 OpenAI 继续共享同一个 tool schema，不增加 provider-specific 分支。
+
+## 2026-08-10：GPT-5.6 Responses API transport
+
+### 现象
+
+修复 strict schema 后，GPT-5.6 的 VERIFY 仍返回 HTTP 400：Chat Completions 不支持
+`reasoning_effort` 与 function tools 同时使用，必须改用 Responses API 或把 effort
+设为 `none`。
+
+### 修改
+
+1. OpenAI GPT-5.6 使用 `responses.create`，配置 `reasoning.effort`、JSON object
+   text format 和原生 function tools。
+2. Kimi 继续使用 Chat Completions，不改变现有请求。
+3. 每个 workflow conversation 保存 `previous_response_id`；下一轮只发送新增的
+   function-call output 或校验反馈，由 Responses 服务端关联 reasoning 与 function
+   call 历史，避免把 response-only 字段错误重放为 input。
+4. Responses 返回被转换为 workflow 已有的统一 message/tool-call 结构，因此
+   DISCOVER、VERIFY、工具执行、trajectory 和 scorer 无需 provider 分支。
+5. 每次 Responses input 显式包含 JSON output protocol；仅在 system instructions
+   中声明 JSON 不满足 Responses `json_object` mode 的请求校验。
+6. 新增 `tests/manual/check_openai.py`，用两轮小请求验证 Responses reasoning、JSON
+   mode、strict `read_file` call、tool result 和最终 JSON，再运行昂贵的完整 suite。
+
+```text
+85 tests passed
+```
+
+## 2026-10-04：完整离线 Benchmark 与官方评分适配
+
+- 锁定 withmartian/code-review-benchmark 的 `e616e849`：50 PR、173 golden。
+- 保留旧一对一 scorer；新入口直接复用官方匹配、语义去重 prompt 与 profile
+  聚合函数。默认关注 Core，同时输出 Strict/All 和 F1/F2。
+- 结构化 issues 直接作为输入，跳过 GitHub 发布与评论抽取；不是官方榜单成绩。
+- 缓存逐对 Judge 判断，失败不写成功 evaluation；支持失败续跑和部分覆盖报告。
+- 配置、源码、golden、输入 diff 和 SHA 校验防止不同实验混合。
+- 固定 checkout 改为 fetch fixture 中的 head SHA；正确识别 GitHub 省略 patch
+  的空 Git blob，仍拒绝无法确认的缺失 patch。
+
+使用现有 `core-defect-verify-v1` 三个 review 结果、gpt-5.2 Judge 重新评分：
+
+| Profile | TP | FP | FN | Precision | Recall | F1 | F2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Core | 6 | 7 | 8 | 46.2% | 42.9% | 44.4% | 43.5% |
+
+这是历史输出的 3/50 子集重新评分，不是当前 agent 全量成绩。当前上游
+Cal.com 10600 有 5 条 golden，旧本地版本为 4 条，新旧分数不能直接归因于
+agent 质量变化。完整 PR 输入下载首次完成 22/50，随后触发 GitHub 匿名 API
+限流；需要配置 GitHub token 续跑。
+
+随后配置 token 后，50/50 个 PR 输入已完成下载与 SHA/diff 校验。Keycloak
+37429 包含内容不变的重命名，GitHub API 不提供文本 patch；输入转换现保留
+`rename from/to` 信息，仅在 changes/additions/deletions 均为 0 时使用该路径。
+新增测试同时验证内容发生变化的缺失 patch 不会被误当成纯重命名。
+
+## 2026-10-04：Kimi K3 与 GPT-6.1 Sol Judge
+
+- Kimi review 默认模型从 K2.6 升级为 `kimi-k3`，保持 `low` 推理强度，先建立
+  成本与延迟可控的完整基线；不声称 low 已在此数据集上优于 high。
+- 完整 benchmark 的 Judge 默认升级为 `gpt-6.1-sol`、`medium`，输出预算 4096。
+  GPT-6 推理请求移除 temperature，截断结果拒绝进入成功评分。
+- Judge 推理强度和输出预算写入判断缓存身份与运行配置，适配版本升为 v2。
+  旧 gpt-5.2 产物保留；跨 Judge 分数不直接当作 agent 提升。
+- Kimi 工具调用 continuation 保留原始 assistant message（包括
+  `reasoning_content`），避免 K3 推理历史丢失。
+- `.env` 的非敏感模型配置已更新；两个 API 账号均确认包含目标 model ID。
+- Kimi 小请求，以及 Judge 正/负匹配与语义去重的真实 API 检查已通过。
+- 99 项自动测试通过。以上连接检查不是完整 50 PR 评测或质量提升证明。
+
 ## 后续记录模板
 
 ```markdown
@@ -1886,3 +2027,121 @@ VERIFY prompt 回归断言覆盖核心缺陷拆分、`revise` 优先和 intended
 
 保留 / 撤销 / 继续观察
 ```
+
+## 2026-10-04：修复验证结束协议并隔离候选失败
+
+### 依据与变更
+
+`kimi-k3-first5-v1` 的 `sentry-67876` 在候选 index=3 的 5 轮验证中，
+先后返回普通文本工具参数、空 decisions，最后使用 diff basis 被校验器拒绝。
+结束提示允许 diff 与 inconclusive，但前者违背该候选的 repository basis，
+后者尚未被解析器接受。这次首先修复已确认的协议冲突，不增加轮数预算。
+
+- 结束提示保持该候选的 required basis；解析器接受 issue=null 的 inconclusive。
+  keep/revise 的来源校验和仓库证据要求保持不变。
+- 对明确、无歧义的普通文本 read_file/search_code 参数执行受限恢复；记录
+  text_tool_recovery，并使用现有路径限制和工具预算。最后一轮不执行工具。
+- 验证格式错误耗尽轮数后，记录候选 inconclusive、failure_kind 和校验错误，
+  保留已确认问题并继续其他候选；API 异常仍向上传播。
+- Benchmark 报告增加候选验证失败诊断。继续对完整标准问题集合评分，
+  不移除未解决候选可能对应的 golden，不改官方评分函数或 Judge 配置。
+
+### 验证与结论
+
+- 全部 113 项自动化测试通过；新增覆盖结束协议、工具恢复、路径和预算约束、
+  单候选失败后保留前后有效问题、API 错误传播及 benchmark 漏报分母。
+- 原基线已结束，4/5 完成评分、1/5 review_failed；旧实验产物保持原样。
+- 尚未进行修改后的真实模型复测，不能宣称完成率或 F1 已提高。
+  下一次需使用新 run name，先复测 sentry-67876，再按同一配置比较 5 例。
+
+## 2026-10-04：以 Tool Gateway 取代普通文本自动执行
+
+### 设计调整
+
+根据用户提出的 proposal → tool layer 架构，撤销上一轮的普通文本工具参数
+自动执行。模型的正式 tool_call 与工作流主动读取均通过 `ToolGateway`；
+普通文本只触发一次格式纠正，重复错误则记录候选 inconclusive。
+
+- 模型只提供工具名、参数、call id；来源、阶段、是否允许工具和预算由工作流控制。
+- Gateway 统一检查来源、阶段、共享预算、工具白名单、参数与路径，再交给执行器。
+  每次允许或拒绝记录 `tool_gateway_decision`，避免工作流读取绕过相同限制。
+- 修复 Python 搜索降级路径跟随符号链接读取仓库外文件的问题。所有读取和搜索
+  禁止符号链接、仓库越界、`.env*`、Git 元数据、常见凭据路径和私钥文件。
+- rg 搜索禁用配置和跟随链接，加入敏感路径过滤并再次校验返回路径。
+- 保留此前的结束协议一致性、候选失败隔离和完整 golden 分母；未改 Judge 或评分器。
+
+### 验证与范围
+
+全部 145 项自动化测试通过，包括正式调用前不执行文本参数、模型与工作流
+共享预算、禁止阶段、字段伪造、敏感路径、两种搜索后端及符号链接访问检查。
+使用的敏感内容均为临时合成测试数据。尚未运行新的真实模型评测。
+
+这是应用层网关，不是 OS 沙箱，不处理并发恶意进程的文件替换，也不能识别
+任意源码中嵌入的秘密或清洗原始 PR diff。详见 `docs/tool-gateway.md`。
+
+## 2026-10-04：Gateway 后 sentry-67876 单例真实复测
+
+运行 `kimi-k3-gateway-sentry67876-v1`，模型、Judge、评分器和 endpoint
+配置与旧基线一致。单例在 397.50 秒完成评审和评分，19 次模型调用；
+TP=1、FP=2、FN=2，Core Precision / Recall / F1 均为 33.3%。
+旧基线此案例失败，无有效分数可直接对比。
+
+8 个候选产生 keep=2、revise=1、rejected=3、inconclusive=2。22 次工具执行
+全部经 gateway，来源均为 workflow、均允许。本次没有真实模型工具调用，
+因此不能宣称模型工具通道已修复。补充上下文阶段仍有 6 次普通文本伪工具
+输出，均未执行，两个候选因上下文未解决而无法确定。其他候选正常继续。
+
+本轮证明该案例可以完成并获得评分，但不证明模型工具协议或准确率已提升。
+下一步应先隔离验证探索阶段的输出协议，再决定是否重跑 5 例。
+详细审计保存在对应实验目录 `audit.md`，原基线产物保持不变。
+
+## 2026-10-04：检查原始 API 响应，排除本地丢失 tool_calls
+
+历史 trace 没有保存原始 HTTP body，此前将 trace 中的空 tool_calls 直接归因
+于模型输出证据不足。新增单请求审计脚本，离线重建 sentry-67876 首次异常
+acquire_context 场景，保存新 API 响应的原始 bytes（SDK parse 前），再与
+同一响应的 SDK 对象、reviewer trace 对比。
+
+本次复现：原始 message 无 tool_calls 字段，finish_reason=stop；content
+是包含 4 项伪 tool_calls 的 JSON 字符串。SDK 与 reviewer 的 content 均与
+原始响应完全一致，正规 tool_calls 三层数量均为 0。因此本次未发生本地
+SDK/adapter 丢失结构化调用；不能继续推断是上游模型还是服务端转换所致，
+也尚未证实 JSON mode 是原因。
+
+正向控制使用真实 SDK + 模拟 HTTP 结构化响应，确认正规工具调用能够通过
+SDK 与 reviewer 完整保留。全部 147 项测试通过。审计产物保存于
+`evals/benchmark-runs/kimi/raw-response-audit-v1/`。未修改生产请求配置。
+
+## 2026-10-04：工具协议异常的最小纠正与明确终止
+
+按用户指定方案，保留原有 JSON mode、模型、网关权限和评分器，仅调整协议
+异常处理。取证与验证阶段识别 content 中的伪工具调用 JSON（包括本次原始
+API 响应中的 tool_calls 数组，以及历史的 tool_calls:1），只标记、不执行。
+
+首次异常在已有阶段预算内只允许一次纠正，反馈明确说明该回复没有执行工具、
+没有获得新上下文。纠正回复必须提供原生工具调用或符合阶段协议的正常结束；
+仍无效则停止该候选后续取证，记录 tool_protocol_error、inconclusive 和
+最后错误。取证阶段可显式报告上下文不足；验证阶段保持原有证据要求。
+正式工具调用继续经过 gateway，其他候选不受影响。
+
+摘要对 inconclusive 候选明确标注上下文不足，协议失败导致空 issues 时不会
+输出“未发现问题”的结论。Benchmark 继续保留所有 golden，并显示协议失败。
+
+全部 166 项自动化测试通过，覆盖原始异常形状、一次纠正后成功调用、显式
+结束、纠正后任意无效回复立即终止、停止后续事实读取、原生调用优先、
+不执行文本内容及评分分母保持不变。尚未执行修改后的真实 API 复测。
+
+## 2026-10-04：协议最小修复后再跑 sentry-67876
+
+`kimi-k3-protocol-sentry67876-v1` 已完成；沿用相同模型、Judge、endpoint
+和官方规则评分器。耗时 450.82 秒，17 次模型调用，TP=0、FP=4、FN=3，
+Core F1=0（上一轮单例 33.3%）。8 个候选中 4 个输出、4 个 inconclusive。
+
+取证第 9 次调用触发工具协议异常，明确反馈后只重试第 10 次；重试仍是
+普通文本伪调用，随即停止该候选取证，记录 tool_protocol_error。其他候选
+继续，摘要明确说明上下文不足。这验证了异常处理行为，但未恢复模型原生
+工具调用。15 次实际工具执行全部由 workflow 发起，经 gateway 允许。
+
+单次评分没有改善，不能把协议恢复边界修复等同于审查能力改善。其余证据
+不足还暴露出自动检索首条命中不相关的问题。建议下一步隔离验证探索请求
+协议与检索相关性，仍保持 benchmark 分母不变。详见实验目录 audit.md。

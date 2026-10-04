@@ -1,8 +1,13 @@
 # AI Code Review Agent
 
-这是一个用于学习和评测 Code Review Agent 的小型项目。当前使用固定的 GitHub PR 作为测试 case，通过 Kimi 生成 review，并与开发集的 golden comments 对比。
+这是一个用于学习和评测 Code Review Agent 的小型项目。当前使用固定的 GitHub PR 作为测试 case，通过 Kimi 或 OpenAI 模型生成 review，并与开发集的 golden comments 对比。
 
 Agent 的逐轮设计变更、失败实验和评估结论记录在 [Agent Learning Changelog](docs/agent-changelog.md)。
+
+完整的 50 PR 本地 benchmark、官方评分口径、断点续跑和诊断报告见
+[完整 Benchmark 使用说明](docs/benchmark.md)。这条新入口直接评估结构化 issues，
+不需要发布 GitHub 评论或申请排行榜。旧 `evals.score` 保留一对一匹配的历史口径，
+不能和新入口的 upstream profile 分数混合比较。
 
 ## 1. 准备虚拟环境
 
@@ -25,6 +30,7 @@ uv run python --version
 
 ```env
 MOONSHOT_API_KEY=your_api_key_here
+KIMI_MODEL=kimi-k3
 KIMI_THINKING=disabled
 LLM_MAX_COMPLETION_TOKENS=2048
 LLM_DISCOVER_MAX_COMPLETION_TOKENS=4096
@@ -32,6 +38,7 @@ LLM_TIMEOUT=120
 LLM_MAX_RETRIES=0
 LLM_TRANSIENT_RETRIES=2
 LLM_RETRY_BACKOFF_SECONDS=1
+LLM_PROGRESS_INTERVAL=30
 LLM_REASONING_EFFORT=low
 ```
 
@@ -39,9 +46,15 @@ LLM_REASONING_EFFORT=low
 
 `LLM_MAX_RETRIES=0` 关闭 SDK 内部的隐藏重试；Agent workflow 会对 timeout、connection error、HTTP 5xx 和 rate limit 显式重试最多 2 次，并将每次失败记录到 trace。退避时间默认依次为 1 秒、2 秒。
 
+每次模型请求会立即打印 stage、turn、attempt 和单次 timeout。请求超过
+`LLM_PROGRESS_INTERVAL`（默认 30 秒）后会持续打印等待时间；timeout 或其他临时
+错误发生时会打印错误及下一次重试。设置为 `0` 可以关闭周期性 heartbeat，但保留
+请求开始、完成和失败日志。注意 `LLM_TIMEOUT=300` 且显式重试 2 次时，单个 workflow
+turn 的最坏等待时间接近 15 分钟，而不是总共 5 分钟。
+
 `.env` 已被 `.gitignore` 排除，不应提交真实 API Key。这里需要使用 Kimi 开放平台的 API Key，不是 Kimi Code 或 Kimi 会员的 Key。
 
-当前 baseline 配置关闭思考模式。以后可以设置：
+当前默认使用 Kimi K3（`low` 推理强度）。若显式使用旧 K2.x 模型，可以设置：
 
 ```env
 KIMI_THINKING=enabled
@@ -53,9 +66,33 @@ KIMI_THINKING=enabled
 `reasoning_effort` 参数控制强度；环境变量 `LLM_REASONING_EFFORT` 支持
 `low`、`high`、`max`，默认使用 `low` 以降低延迟和 token 消耗。
 
+### 配置 OpenAI review 模型
+
+同一个 `.env` 可以同时保存两个 provider 的 key：
+
+```env
+MOONSHOT_API_KEY=your_moonshot_key
+OPENAI_API_KEY=your_openai_key
+OPENAI_MODEL=gpt-5.6
+```
+
+Runner 会把 `--provider` 显式传给 Reviewer：`kimi` 只读取
+`MOONSHOT_API_KEY` 并使用 Moonshot endpoint，`openai` 只读取
+`OPENAI_API_KEY` 并使用 OpenAI 默认 endpoint。即使两个 key 同时存在，也不会再
+因环境变量优先级误用 Kimi。
+
+Kimi 使用 Chat Completions API；OpenAI GPT-5.6 使用 Responses API，因为
+GPT-5.6 的 Chat Completions endpoint 不支持 reasoning effort 与 function tools
+同时使用。两者仍共享相同的 Agent prompt、工具定义、workflow 状态、预算和输出
+校验。
+
+OpenAI 当前默认 review model 是 `gpt-5.6`，默认 reasoning effort 是
+`medium`。也可以在单次命令中用 `LLM_MODEL` 和 `LLM_REASONING_EFFORT` 覆盖。
+GPT-5.6 支持 `none`、`low`、`medium`、`high`、`xhigh` 和 `max`。
+
 ## 3. 测试 Kimi 模型连接
 
-先运行最小连通性测试，确认 API Key、端点和 `kimi-k2.6` 模型正常：
+先运行最小连通性测试，确认 API Key、端点和配置的模型（默认 `kimi-k3`）正常：
 
 ```bash
 uv run python tests/manual/check_kimi.py
@@ -70,6 +107,17 @@ PASS: Kimi connection is working
 ```
 
 这个测试只发送一个很短的请求，不会运行完整 Code Review。
+
+OpenAI GPT-5.6 使用 Responses API。首次运行 benchmark 前，先用两轮小请求验证
+reasoning、JSON mode、strict function schema 和 tool-result continuation：
+
+```bash
+LLM_MODEL=gpt-5.6 LLM_REASONING_EFFORT=medium \
+uv run python tests/manual/check_openai.py
+```
+
+成功时会输出 `PASS: OpenAI Responses connection is working`。这个检查会实际读取
+当前仓库的 `README.md`，但不会运行 fixture checkout、DISCOVER 或评分。
 
 ## 4. 测试 case
 
@@ -111,6 +159,20 @@ uv run python -m evals.run_eval \
   --provider kimi \
   --run-name sop-v1
 ```
+
+使用相同 Agent 配置运行 OpenAI 模型对照：
+
+```bash
+LLM_MODEL=gpt-5.6 LLM_REASONING_EFFORT=medium \
+uv run python -m evals.run_suite \
+  --case-id sentry-93824 grafana-79265 calcom-10600 \
+  --provider openai \
+  --run-name gpt-5-6-medium-v1
+```
+
+Review 和 Judge 都使用 `OPENAI_API_KEY`，但它们仍是两次独立调用：review model
+由 `LLM_MODEL` 控制，judge model 由 `JUDGE_MODEL` 控制。结果保存在
+`evals/runs/openai/gpt-5-6-medium-v1/`，不会与 Kimi 结果混合。
 
 Eval runner 会：
 

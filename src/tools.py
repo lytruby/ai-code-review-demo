@@ -1,5 +1,6 @@
 import json
 import os
+from fnmatch import fnmatchcase
 from pathlib import Path
 import subprocess
 
@@ -9,6 +10,62 @@ DEFAULT_CONTEXT_LINES = 50
 MAX_CONTEXT_LINES = 100
 MAX_SEARCH_QUERY_CHARS = 200
 MAX_SEARCH_MATCHES = 20
+
+# Conservative filename policy shared by direct reads and both search backends.
+# This is not a secret detector: credentials must not be stored in source files.
+BLOCKED_PATH_PATTERNS = (
+    ".env*", ".git", ".ssh", ".aws", ".azure", ".gnupg", ".kube",
+    ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".secrets",
+    "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore",
+    "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
+    "credentials.json", "credentials.yaml", "credentials.yml", "credentials.toml",
+    "secrets.json", "secrets.yaml", "secrets.yml", "secrets.toml",
+)
+
+
+class ToolAccessError(ValueError):
+    """A request denied by the repository file access policy."""
+
+
+def _check_path_policy(path: Path) -> None:
+    if any(fnmatchcase(part.lower(), pattern) for part in path.parts for pattern in BLOCKED_PATH_PATTERNS):
+        raise ToolAccessError("Access to sensitive or repository metadata paths is denied")
+
+
+def validate_tool_request(tool_name: str, arguments: str, repository_root: Path) -> dict:
+    """Validate the complete proposal before any executor is called."""
+    if tool_name not in {"read_file", "search_code"}:
+        raise ValueError(f"Unknown tool: {tool_name}")
+    if not isinstance(arguments, str):
+        raise ValueError("Tool arguments must be valid JSON")
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("Tool arguments must be valid JSON") from error
+    if not isinstance(parsed, dict):
+        raise ValueError("Tool arguments must be an object")
+    if tool_name == "read_file":
+        if not set(parsed) <= {"path", "line", "context_lines"} or "path" not in parsed:
+            raise ValueError("read_file requires path and accepts optional line and context_lines")
+        line, context = parsed.get("line"), parsed.get("context_lines")
+        if line is not None and (type(line) is not int or line < 1):
+            raise ValueError("line must be a positive integer")
+        if context is not None and (type(context) is not int or not 0 <= context <= MAX_CONTEXT_LINES):
+            raise ValueError("context_lines must be an integer within the tool limit")
+        if context is not None and line is None:
+            raise ValueError("context_lines requires line")
+        _resolve_repository_path(parsed["path"], repository_root)
+    else:
+        if not set(parsed) <= {"query", "path"} or "query" not in parsed:
+            raise ValueError("search_code requires query and accepts an optional path")
+        query = parsed["query"]
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("Search query must be a non-empty string")
+        if len(query) > MAX_SEARCH_QUERY_CHARS or "\n" in query or "\r" in query:
+            raise ValueError("Search query must be one line within the tool limit")
+        if parsed.get("path") is not None:
+            _resolve_repository_path(parsed["path"], repository_root, require_file=False)
+    return parsed
 
 READ_FILE_TOOL = {
     "type": "function",
@@ -25,21 +82,24 @@ READ_FILE_TOOL = {
                 "description": "Path to the file, relative to the repository root.",
             },
             "line": {
-                "type": "integer",
+                "type": ["integer", "null"],
                 "minimum": 1,
-                "description": "Optional center line for reading a window.",
+                "description": (
+                    "Center line for reading a window, or null to read the "
+                    "whole file when it fits."
+                ),
             },
             "context_lines": {
-                "type": "integer",
+                "type": ["integer", "null"],
                 "minimum": 0,
                 "maximum": MAX_CONTEXT_LINES,
                 "description": (
-                    "Lines to read before and after line. Defaults to 50 and "
-                    "requires line."
+                    "Lines to read before and after line, or null for the "
+                    "default of 50. Requires a non-null line when non-null."
                 ),
             },
         },
-        "required": ["path"],
+        "required": ["path", "line", "context_lines"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -60,13 +120,14 @@ SEARCH_CODE_TOOL = {
                 "description": "Exact text to search for in repository files.",
             },
             "path": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": (
-                    "Optional repository-relative file or directory to search."
+                    "Repository-relative file or directory to search, or null "
+                    "to search the whole repository."
                 ),
             },
         },
-        "required": ["query"],
+        "required": ["query", "path"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -88,23 +149,9 @@ def execute_tool(
     arguments: str,
     repository_root: Path,
 ) -> str:
-    if tool_name not in {"read_file", "search_code"}:
-        return json.dumps({"ok": False, "error": f"Unknown tool: {tool_name}"})
-
     try:
-        parsed_arguments = json.loads(arguments)
-    except json.JSONDecodeError:
-        return json.dumps({"ok": False, "error": "Tool arguments must be valid JSON"})
-
-    if not isinstance(parsed_arguments, dict):
-        return json.dumps({"ok": False, "error": "Tool arguments must be an object"})
-    try:
+        parsed_arguments = validate_tool_request(tool_name, arguments, repository_root)
         if tool_name == "read_file":
-            allowed = {"path", "line", "context_lines"}
-            if not set(parsed_arguments) <= allowed or "path" not in parsed_arguments:
-                raise ValueError(
-                    "read_file requires path and accepts optional line and context_lines"
-                )
             result = read_file(
                 path=parsed_arguments["path"],
                 line=parsed_arguments.get("line"),
@@ -112,11 +159,6 @@ def execute_tool(
                 repository_root=repository_root,
             )
         else:
-            allowed = {"query", "path"}
-            if not set(parsed_arguments) <= allowed or "query" not in parsed_arguments:
-                raise ValueError(
-                    "search_code requires query and accepts an optional path"
-                )
             result = search_code(
                 query=parsed_arguments["query"],
                 path=parsed_arguments.get("path"),
@@ -132,7 +174,7 @@ def execute_tool(
                 "hint": "Call read_file again with line and context_lines.",
             }
         )
-    except (FileNotFoundError, ValueError) as error:
+    except (OSError, ValueError, RuntimeError) as error:
         return json.dumps({"ok": False, "error": str(error)})
 
     return json.dumps({"ok": True, **result})
@@ -227,14 +269,16 @@ def search_code(
 
     command = [
         "rg",
+        "--no-config",
+        "--no-follow",
         "--json",
         "--fixed-strings",
         "--color",
         "never",
-        "--",
-        query,
-        target_argument,
     ]
+    for pattern in BLOCKED_PATH_PATTERNS:
+        command.extend(["--iglob", f"!{pattern}", "--iglob", f"!{pattern}/**"])
+    command.extend(["--", query, target_argument])
     try:
         process = subprocess.Popen(
             command,
@@ -260,6 +304,11 @@ def search_code(
         if event.get("type") != "match":
             continue
         data = event["data"]
+        # Defense in depth: the glob filter is not the access-policy authority.
+        try:
+            _resolve_repository_path(data["path"]["text"], root)
+        except (OSError, ValueError, RuntimeError):
+            continue
         if len(matches) >= max_matches:
             truncated = True
             process.terminate()
@@ -294,19 +343,25 @@ def _search_code_without_rg(
     else:
         files = []
         for directory, directory_names, file_names in os.walk(search_target):
-            directory_names[:] = sorted(
-                name
-                for name in directory_names
-                if name not in {".git", ".venv", "node_modules"}
-            )
+            allowed_directories = []
+            for name in sorted(directory_names):
+                if name in {".venv", "node_modules"}:
+                    continue
+                try:
+                    _resolve_repository_path(str((Path(directory) / name).relative_to(repository_root)), repository_root, require_file=False)
+                except (OSError, ValueError, RuntimeError):
+                    continue
+                allowed_directories.append(name)
+            directory_names[:] = allowed_directories
             files.extend(Path(directory) / name for name in sorted(file_names))
 
     matches = []
     truncated = False
     for file_path in files:
         try:
-            content = file_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            safe_path = _resolve_repository_path(str(file_path.relative_to(repository_root)), repository_root)
+            content = safe_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
             continue
         for line_number, line_content in enumerate(content.splitlines(), start=1):
             if query not in line_content:
@@ -341,14 +396,22 @@ def _resolve_repository_path(
         raise ValueError("Path must be a non-empty string")
     relative_path = Path(path)
     if relative_path.is_absolute():
-        raise ValueError("Path must be relative to the repository")
+        raise ToolAccessError("Path must be relative to the repository")
 
     root = repository_root.resolve()
-    target = (root / relative_path).resolve()
+    unresolved = root / relative_path
+    target = unresolved.resolve()
     try:
         target.relative_to(root)
     except ValueError as error:
-        raise ValueError("Path must stay inside the repository") from error
+        raise ToolAccessError("Path must stay inside the repository") from error
+    _check_path_policy(relative_path)
+    _check_path_policy(target.relative_to(root))
+    current = root
+    for part in relative_path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ToolAccessError("Symbolic links are not allowed for repository tools")
     if not target.exists():
         raise FileNotFoundError(f"Path not found: {path}")
     if require_file and not target.is_file():

@@ -61,7 +61,7 @@ def main() -> None:
         required=True,
         help="One or more fixture ids.",
     )
-    parser.add_argument("--provider", required=True)
+    parser.add_argument("--provider", required=True, choices=("kimi", "openai"))
     parser.add_argument("--run-name", required=True)
     args = parser.parse_args()
 

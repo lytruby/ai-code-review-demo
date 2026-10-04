@@ -64,7 +64,7 @@ def checkout_pr(metadata: dict, destination: Path) -> None:
     for retry_index in range(GIT_FETCH_RETRIES + 1):
         try:
             _run_git(
-                ["fetch", "--depth=1", "origin", f"pull/{pull_number}/head"],
+                ["fetch", "--depth=1", "origin", expected_head],
                 destination,
             )
             break
@@ -168,12 +168,16 @@ def run_case(
     reviewer_factory: Callable[..., OpenAIReviewer] = OpenAIReviewer,
     checkout: Callable[[dict, Path], None] = checkout_pr,
     repository_cache: Path | None = None,
+    provider: str | None = None,
 ) -> Path:
     metadata, changes = load_fixture(fixture_dir)
     case_id = metadata["id"]
 
     def review_repository(repository_root: Path):
-        reviewer = reviewer_factory(repository_root=repository_root)
+        reviewer_options = {"repository_root": repository_root}
+        if provider is not None:
+            reviewer_options["provider"] = provider
+        reviewer = reviewer_factory(**reviewer_options)
         try:
             result = reviewer.review(changes)
         except Exception as error:
@@ -217,6 +221,7 @@ def main() -> None:
     parser.add_argument(
         "--provider",
         required=True,
+        choices=("kimi", "openai"),
         help="Model provider name used as the output directory, for example kimi.",
     )
     parser.add_argument(
@@ -249,6 +254,7 @@ def main() -> None:
         fixture_dir,
         run_dir,
         repository_cache=args.repository_cache,
+        provider=args.provider.lower(),
     )
     print(f"saved {result_path}")
 

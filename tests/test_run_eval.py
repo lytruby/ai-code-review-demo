@@ -88,6 +88,30 @@ def test_run_case_uses_checked_out_repository(tmp_path):
     assert saved["trace"][0]["type"] == "model_response"
 
 
+def test_run_case_passes_explicit_provider_to_reviewer(tmp_path):
+    fixture = make_fixture(tmp_path)
+    observed = {}
+
+    class FakeReviewer:
+        def __init__(self, repository_root, provider):
+            observed["provider"] = provider
+            self.last_trace = []
+
+        def review(self, changes):
+            return ReviewResult(summary="No issues")
+
+    result_path = run_case(
+        fixture,
+        tmp_path / "runs",
+        reviewer_factory=FakeReviewer,
+        checkout=lambda metadata, destination: None,
+        provider="openai",
+    )
+
+    assert result_path.is_file()
+    assert observed["provider"] == "openai"
+
+
 def test_checkout_pr_rejects_changed_head(tmp_path, monkeypatch):
     outputs = iter(["", "", "", "different-head"])
 

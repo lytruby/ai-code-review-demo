@@ -48,6 +48,22 @@ class FakeCompletions:
         return response_or_error
 
 
+class FakeResponses:
+    def __init__(self, responses):
+        self.responses = responses
+        self.requests = []
+
+    def create(self, **request):
+        self.requests.append(request)
+        instructions = request["instructions"]
+        if (
+            "Discovery pass:" in instructions
+            and "Discovery pass: correctness" not in instructions
+        ):
+            return responses_response('{"candidates":[]}')
+        return self.responses.pop(0)
+
+
 def response(content=None, tool_calls=None, finish_reason="stop", usage=None):
     return SimpleNamespace(
         usage=usage,
@@ -57,6 +73,31 @@ def response(content=None, tool_calls=None, finish_reason="stop", usage=None):
                 message=SimpleNamespace(content=content, tool_calls=tool_calls),
             )
         ]
+    )
+
+
+def responses_response(
+    content,
+    output=None,
+    status="completed",
+    usage=None,
+    response_id="response-test",
+):
+    if output is None:
+        output = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": content}],
+            }
+        ]
+    return SimpleNamespace(
+        id=response_id,
+        output_text=content,
+        output=output,
+        status=status,
+        incomplete_details=None,
+        usage=usage,
     )
 
 
@@ -124,7 +165,7 @@ def test_reviewer_runs_discover_verify_and_finalize_with_tool(tmp_path):
     verify_after_tool = completions.requests[5]["messages"]
     assert verify_after_tool[-1]["role"] == "tool"
     assert "def divide" in verify_after_tool[-1]["content"]
-    assert [event["stage"] for event in reviewer.last_trace if "stage" in event] == [
+    assert [event["stage"] for event in reviewer.last_trace if "stage" in event and event["type"] != "tool_gateway_decision"] == [
         "discover",
         "discover",
         "discover",
@@ -231,8 +272,182 @@ def test_kimi_k3_rejects_invalid_reasoning_effort(tmp_path, monkeypatch):
         )
 
 
-def test_reviewer_retries_transient_api_error_without_using_model_turn(
+def test_kimi_assistant_continuation_preserves_reasoning_and_tools():
+    from openai.types.chat import ChatCompletionMessage
+
+    raw = {
+        "role": "assistant", "content": None, "reasoning_content": "Need source evidence.",
+        "tool_calls": [{"id": "call-read", "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"x.py"}'}}],
+    }
+    message = ChatCompletionMessage.model_validate(raw)
+    messages = []
+    OpenAIReviewer._append_assistant(messages, message)
+    assert messages == [raw]
+
+
+def test_provider_selects_matching_api_key_and_endpoint(tmp_path, monkeypatch):
+    created_clients = []
+
+    class FakeOpenAI:
+        def __init__(self, **options):
+            created_clients.append(options)
+
+    monkeypatch.setattr("src.reviewer.OpenAI", FakeOpenAI)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "moonshot-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("LLM_BASE_URL", "https://custom-moonshot.example/v1")
+    monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
+
+    openai_reviewer = OpenAIReviewer(
+        repository_root=tmp_path,
+        provider="openai",
+        model="gpt-5.6",
+    )
+    kimi_reviewer = OpenAIReviewer(
+        repository_root=tmp_path,
+        provider="kimi",
+        model="kimi-k3",
+    )
+
+    assert openai_reviewer.provider == "openai"
+    assert openai_reviewer.reasoning_effort == "medium"
+    assert created_clients[0]["api_key"] == "openai-secret"
+    assert "base_url" not in created_clients[0]
+    assert created_clients[1]["api_key"] == "moonshot-secret"
+    assert created_clients[1]["base_url"] == "https://custom-moonshot.example/v1"
+
+
+def test_gpt_5_6_requests_use_medium_reasoning_effort(tmp_path, monkeypatch):
+    monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
+    responses = FakeResponses(
+        [
+            responses_response('{"candidates":[]}'),
+            responses_response('{"status":"complete","summary":"No issues"}'),
+        ]
+    )
+    reviewer = OpenAIReviewer(
+        client=SimpleNamespace(responses=responses),
+        repository_root=tmp_path,
+        provider="openai",
+        model="gpt-5.6",
+    )
+
+    reviewer.review([{"filename": "example.py", "patch": "+value = 1"}])
+
+    assert len(responses.requests) == 5
+    for request in responses.requests:
+        assert request["reasoning"] == {"effort": "medium"}
+        assert request["text"] == {"format": {"type": "json_object"}}
+        assert "valid JSON" in request["input"][0]["content"]
+        assert "messages" not in request
+        assert "extra_body" not in request
+
+
+def test_responses_continuation_uses_previous_id_and_only_new_tool_output(
     tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "medium")
+    responses = FakeResponses(
+        [
+            responses_response(
+                "",
+                output=[
+                    {"type": "reasoning", "id": "reasoning-1", "summary": []},
+                    {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "read_file",
+                        "arguments": (
+                            '{"path":"example.py","line":null,'
+                            '"context_lines":null}'
+                        ),
+                        "status": "completed",
+                    },
+                ],
+                response_id="response-1",
+            ),
+            responses_response(
+                '{"status":"complete"}',
+                response_id="response-2",
+            ),
+        ]
+    )
+    reviewer = OpenAIReviewer(
+        client=SimpleNamespace(responses=responses),
+        repository_root=tmp_path,
+        provider="openai",
+        model="gpt-5.6",
+    )
+    state = ReviewState(stage="verify")
+    messages = [
+        {"role": "system", "content": "Return JSON"},
+        {"role": "user", "content": "Read the file"},
+    ]
+
+    first = reviewer._request(messages, state, allow_tools=True)
+    reviewer._append_assistant(messages, first)
+    messages.append(
+        {"role": "tool", "tool_call_id": "call-1", "content": '{"ok":true}'}
+    )
+    second = reviewer._request(messages, state, allow_tools=False)
+
+    continuation = responses.requests[1]
+    assert first.tool_calls[0].function.name == "read_file"
+    assert second.content == '{"status":"complete"}'
+    assert continuation["previous_response_id"] == "response-1"
+    assert continuation["input"][1:] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"ok":true}',
+        }
+    ]
+    assert not any("status" in item for item in continuation["input"])
+
+
+def test_gpt_responses_request_sends_native_function_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "medium")
+    responses = FakeResponses(
+        [
+            responses_response(
+                "",
+                output=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "search_code",
+                        "arguments": '{"query":"value","path":null}',
+                    }
+                ],
+            )
+        ]
+    )
+    reviewer = OpenAIReviewer(
+        client=SimpleNamespace(responses=responses),
+        repository_root=tmp_path,
+        provider="openai",
+        model="gpt-5.6",
+    )
+    state = ReviewState(stage="verify")
+
+    message = reviewer._request(
+        [
+            {"role": "system", "content": "Return JSON"},
+            {"role": "user", "content": "Verify candidate"},
+        ],
+        state,
+        allow_tools=True,
+    )
+
+    assert responses.requests[0]["tools"][0]["name"] == "read_file"
+    assert responses.requests[0]["tools"][1]["name"] == "search_code"
+    assert responses.requests[0]["tools"][0]["strict"] is True
+    assert message.tool_calls[0].function.name == "search_code"
+
+
+def test_reviewer_retries_transient_api_error_without_using_model_turn(
+    tmp_path, monkeypatch, capsys
 ):
     class TemporaryAPIError(Exception):
         pass
@@ -261,17 +476,17 @@ def test_reviewer_retries_transient_api_error_without_using_model_turn(
         for event in reviewer.last_trace
         if event["type"] == "model_request_error"
     ]
-    assert request_errors == [
-        {
-            "type": "model_request_error",
-            "stage": "discover",
-            "attempt": 1,
-            "will_retry": True,
-            "error_type": "TemporaryAPIError",
-            "status_code": None,
-            "error": "temporary gateway failure",
-        }
-    ]
+    assert len(request_errors) == 1
+    assert request_errors[0]["stage"] == "discover"
+    assert request_errors[0]["attempt"] == 1
+    assert request_errors[0]["will_retry"] is True
+    assert request_errors[0]["error_type"] == "TemporaryAPIError"
+    assert request_errors[0]["error"] == "temporary gateway failure"
+    assert request_errors[0]["elapsed_seconds"] >= 0
+    stderr = capsys.readouterr().err
+    assert "model request stage=discover turn=1 attempt=1/3" in stderr
+    assert "model request failed stage=discover" in stderr
+    assert "model response stage=discover turn=1 attempt=2" in stderr
 
 
 def test_reviewer_retries_invalid_discover_output(tmp_path):
@@ -1179,3 +1394,327 @@ def test_discover_requires_candidate_file_in_cross_file_evidence():
 
     with pytest.raises(ValueError, match="Candidate file must appear"):
         OpenAIReviewer._parse_candidates(output, changes)
+
+
+def verification_candidate(path="example.py", repository=False):
+    return CandidateIssue(
+        file=path, severity="medium", claim="Changed behavior",
+        evidence=[EvidenceRef(side="after", text="changed()")],
+        required_facts=[RequiredFact(question="Check definition", source="repository", path=path)] if repository else [],
+    )
+
+
+def verification_decision(path="example.py", basis="diff", verdict="keep"):
+    return json.dumps({"decisions": [{
+        "candidate_index": 0, "verdict": verdict, "basis": basis,
+        "reason": "Checked the available evidence",
+        "supporting_evidence": [{"source": basis, "file": path, "side": "after", "text": "changed()"}],
+        "issue": {"file": path, "severity": "medium", "description": "Changed behavior", "suggestion": "Fix behavior"}
+        if verdict in {"keep", "revise"} else None,
+    }]})
+
+
+def verification_reviewer(tmp_path, responses):
+    completions = FakeCompletions(responses)
+    reviewer = OpenAIReviewer(
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+        repository_root=tmp_path, model="test",
+    )
+    return reviewer, completions
+
+
+def test_repository_finalization_accepts_inconclusive_without_switching_basis(tmp_path):
+    reviewer, completions = verification_reviewer(tmp_path, [
+        *[response("{}") for _ in range(4)],
+        response(verification_decision(basis="repository", verdict="inconclusive")),
+    ])
+    state = ReviewState(stage="verify")
+    issues, decision = reviewer._verify_candidate(
+        "File: example.py\nPatch:\n+changed()", verification_candidate(repository=True),
+        0, state, repository_context=[], initial_successful_tool_calls=1,
+    )
+    assert issues == []
+    assert decision["verdict"] == "inconclusive"
+    assert "failure_kind" not in decision
+    final_request = completions.requests[-1]
+    assert "tools" not in final_request
+    assert "Keep basis=repository" in final_request["messages"][-1]["content"]
+    assert "use basis=diff" not in final_request["messages"][-1]["content"]
+    with pytest.raises(ValueError, match="basis must be repository"):
+        reviewer._parse_decisions(
+            verification_decision(basis="diff"), [verification_candidate(repository=True)],
+            expected_basis="repository", repository_context_available=True,
+        )
+    invalid = json.loads(verification_decision())
+    invalid["decisions"][0]["verdict"] = "inconclusive"
+    with pytest.raises(ValueError, match="null issue"):
+        reviewer._parse_decisions(json.dumps(invalid), [verification_candidate()])
+
+
+def test_textual_tool_arguments_require_a_formal_call_before_execution(tmp_path):
+    (tmp_path / "example.py").write_text("changed()\n")
+    call = SimpleNamespace(id="formal-read", function=SimpleNamespace(
+        name="read_file", arguments='{"path":"example.py"}',
+    ))
+    reviewer, completions = verification_reviewer(tmp_path, [
+        response('{"path":"example.py","line":1,"context_lines":0}'),
+        response(tool_calls=[call]),
+        response(verification_decision(basis="repository")),
+    ])
+    state = ReviewState(stage="verify")
+    issues, decision = reviewer._verify_candidate(
+        "File: example.py\nPatch:\n+changed()", verification_candidate(repository=True),
+        3, state, repository_context=[], initial_successful_tool_calls=0,
+    )
+    assert len(issues) == 1
+    assert decision["candidate_index"] == 3
+    assert state.tool_calls == 1
+    assert "Nothing was executed" in completions.requests[1]["messages"][-1]["content"]
+    results = [e for e in state.trace if e["type"] == "tool_result"]
+    assert len(results) == 1
+    assert results[0]["tool_call_id"] == "formal-read"
+    decisions = [e for e in state.trace if e["type"] == "tool_gateway_decision"]
+    assert len(decisions) == 1 and decisions[0]["allowed"] is True
+    assert len(completions.requests) == 3
+
+
+@pytest.mark.parametrize("output", [
+    '{"query":"symbol","line":1}', '{"path":"example.py","command":"rm"}',
+    '{"path":42}', '{"path":"example.py","line":true}',
+    '{"decisions":[],"path":"example.py"}', 'not JSON',
+])
+def test_textual_tool_detector_rejects_ambiguous_or_invalid_requests(output):
+    assert OpenAIReviewer._text_tool_name(output) is None
+
+
+@pytest.mark.parametrize("final_response", [
+    response('{"path":"example.py"}'),
+    response(tool_calls=[SimpleNamespace(id="late-tool", function=SimpleNamespace(name="read_file", arguments='{"path":"example.py"}'))]),
+])
+def test_finalization_never_executes_tools_even_if_model_requests_them(tmp_path, final_response):
+    reviewer, _ = verification_reviewer(tmp_path, [*[response("{}") for _ in range(4)], final_response])
+    state = ReviewState(stage="verify")
+    issues, decision = reviewer._verify_candidate(
+        "File: example.py\nPatch:\n+changed()", verification_candidate(),
+        0, state, repository_context=[], initial_successful_tool_calls=0,
+    )
+    assert issues == []
+    assert state.tool_calls == 0
+    assert decision["failure_kind"] == ("verification_turn_limit" if final_response.choices[0].message.tool_calls else "tool_protocol_error")
+
+
+def test_repeated_textual_tool_arguments_are_inconclusive_without_any_execution(tmp_path):
+    (tmp_path / "example.py").write_text("changed()\n")
+    reviewer, completions = verification_reviewer(tmp_path, [
+        response('{"path":"example.py"}'), response('{"query":"changed"}'),
+    ])
+    state = ReviewState(stage="verify")
+    issues, decision = reviewer._verify_candidate("", verification_candidate(), 0, state, [], 0)
+    assert issues == []
+    assert decision["verdict"] == "inconclusive"
+    assert decision["failure_kind"] == "tool_protocol_error"
+    assert state.tool_calls == 0
+    assert not any(e["type"] in {"tool_result", "tool_gateway_decision"} for e in state.trace)
+    assert len(completions.requests) == 2
+
+
+def test_workflow_reads_pass_through_gateway_and_do_not_expose_sensitive_files(tmp_path):
+    (tmp_path / ".env").write_text("SYNTHETIC_SECRET_ONLY=example\n")
+    reviewer, _ = verification_reviewer(tmp_path, [])
+    state = ReviewState(stage="acquire_context")
+    output, succeeded = reviewer._execute_workflow_tool(
+        "read_file", '{"path":".env"}', 0, 0, state,
+    )
+    assert not succeeded
+    assert "SYNTHETIC_SECRET_ONLY" not in output
+    decision = next(e for e in state.trace if e["type"] == "tool_gateway_decision")
+    assert decision["origin"] == "workflow"
+    assert decision["allowed"] is False
+    assert decision["code"] == "path_denied"
+
+
+def test_candidate_turn_exhaustion_preserves_prior_issues_and_continues_review(tmp_path):
+    from dataclasses import asdict
+    candidates = [verification_candidate(p) for p in ("first.py", "failed.py", "last.py")]
+    reviewer, _ = verification_reviewer(tmp_path, [
+        response(json.dumps({"candidates": [asdict(c) for c in candidates]})),
+        response(verification_decision("first.py")),
+        *[response('{"decisions":[]}') for _ in range(5)],
+        response(verification_decision("last.py")),
+        response('{"status":"complete","summary":"Two verified issues"}'),
+    ])
+    result = reviewer.review([{"filename": c.file, "patch": "+changed()"} for c in candidates])
+    assert result.status == "complete"
+    assert [i.file for i in result.issues] == ["first.py", "last.py"]
+    decisions = [e for e in reviewer.last_trace if e["type"] == "candidate_result"]
+    assert [d["verdict"] for d in decisions] == ["keep", "inconclusive", "keep"]
+    assert decisions[1]["failure_kind"] == "verification_turn_limit"
+    assert "one decision per candidate" in decisions[1]["last_validation_error"]
+
+
+def test_candidate_recovery_does_not_swallow_api_errors(tmp_path):
+    reviewer, _ = verification_reviewer(tmp_path, [RuntimeError("Provider unavailable")])
+    state = ReviewState(stage="verify")
+    with pytest.raises(RuntimeError, match="Provider unavailable"):
+        reviewer._verify_candidate("", verification_candidate(), 0, state, [], 0)
+    assert not any(e["type"] == "candidate_result" for e in state.trace)
+
+
+@pytest.mark.parametrize('structured', [True, False])
+def test_kimi_wire_response_preserves_tool_calls_through_real_sdk_and_reviewer(tmp_path, structured):
+    import httpx
+    from openai import OpenAI
+    wire_message = {
+        'role': 'assistant',
+        'content': None if structured else '{"tool_calls":[{"name":"read_file","arguments":{"path":"example.py"}}]}',
+        'reasoning_content': 'Synthetic provider metadata',
+    }
+    wire_calls = [{
+        'id': 'call-wire-test', 'type': 'function',
+        'function': {'name': 'read_file', 'arguments': '{"path":"example.py","line":1,"context_lines":0}'},
+    }] if structured else []
+    if structured:
+        wire_message['tool_calls'] = wire_calls
+    wire = {
+        'id': 'chatcmpl-wire-test', 'object': 'chat.completion', 'created': 1,
+        'model': 'kimi-k3', 'choices': [{
+            'index': 0, 'message': wire_message,
+            'finish_reason': 'tool_calls' if structured else 'stop',
+        }],
+    }
+    def transport(request):
+        sent = json.loads(request.content)
+        assert sent['tools'][0]['function']['name'] == 'read_file'
+        return httpx.Response(200, json=wire)
+    with OpenAI(api_key='synthetic-test-key', base_url='https://provider.invalid/v1',
+                http_client=httpx.Client(transport=httpx.MockTransport(transport))) as client:
+        reviewer = OpenAIReviewer(client=client, provider='kimi', model='kimi-k3', repository_root=tmp_path)
+        state = ReviewState(stage='verify')
+        message = reviewer._request([{'role':'system', 'content':'Use tools or JSON.'}], state, allow_tools=True)
+        assert len(message.tool_calls or []) == len(wire_calls)
+        assert state.trace[-1]['tool_calls'] == [
+            {'id':c['id'], 'name':c['function']['name'], 'arguments':c['function']['arguments']} for c in wire_calls
+        ]
+        assert message.content == wire_message['content'] == state.trace[-1]['content']
+        assert message.reasoning_content == wire_message['reasoning_content']
+
+
+@pytest.mark.parametrize('content', [
+    '{"tool_calls":[{"name":"search_code","arguments":{"query":"sender"}}]}',
+    '{"tool_calls":[{"function":{"name":"read_file","arguments":"{}"}}]}',
+    '{"tool_calls":[{"query":"sender","path":"source.py"}]}',
+    '{"tool_calls":1}',
+    '{"name":"functions.search_code","arguments":{"query":"sender"}}',
+    '{"function_call":{"name":"read_file","arguments":"{}"}}',
+])
+def test_text_tool_envelopes_are_protocol_errors_not_executable(content):
+    assert OpenAIReviewer._has_text_tool_proposal(content)
+
+
+@pytest.mark.parametrize('content', [
+    '{"decisions":[{"reason":"tool_calls is just a word in evidence"}]}',
+    '{"status":"inconclusive","reason":"Missing context"}',
+    '{"source":"diff","text":"example()"}',
+    'Call read_file please',
+])
+def test_normal_review_text_is_not_misclassified_as_tool_proposal(content):
+    assert not OpenAIReviewer._has_text_tool_proposal(content)
+
+
+def unresolved_protocol_fact():
+    fact = RequiredFact(question='Find definition', source='repository', query='not_found_symbol')
+    context = {'required_fact': {}, 'search': {'ok':True, 'matches':[]}, 'read':None, 'resolved':False, 'tool_calls':0}
+    return fact, context
+
+
+@pytest.mark.parametrize('retry_content', ['{"tool_calls":1}', '{}', 'not JSON'])
+def test_context_protocol_retry_failure_stops_without_executing_text(tmp_path, retry_content):
+    reviewer, completions = verification_reviewer(tmp_path, [
+        response('{"tool_calls":[{"name":"read_file","arguments":{"path":"example.py"}}]}'),
+        response(retry_content),
+    ])
+    state = ReviewState(stage='acquire_context')
+    fact, context = unresolved_protocol_fact()
+    count = reviewer._recover_required_fact(verification_candidate(), fact, 0, 0, context, state)
+    assert count == 0 and state.tool_calls == 0
+    assert not context['resolved'] and context['failure_kind'] == 'tool_protocol_error'
+    assert len(completions.requests) == 2
+    feedback = completions.requests[1]['messages'][-1]['content']
+    assert 'Nothing was executed' in feedback and 'No new context was obtained' in feedback
+    assert not any(e['type'] in {'tool_result', 'tool_gateway_decision'} for e in state.trace)
+    assert [e['retry_allowed'] for e in state.trace if e['type']=='tool_protocol_error'] == [True, False]
+
+
+def test_context_protocol_retry_can_produce_a_native_gateway_call(tmp_path):
+    (tmp_path/'example.py').write_text('changed()\n')
+    native = SimpleNamespace(id='native-after-correction', function=SimpleNamespace(name='read_file', arguments='{"path":"example.py"}'))
+    reviewer, completions = verification_reviewer(tmp_path, [
+        response('{"tool_calls":1}'), response(tool_calls=[native]),
+    ])
+    state = ReviewState(stage='acquire_context')
+    fact, context = unresolved_protocol_fact()
+    count = reviewer._recover_required_fact(verification_candidate(), fact, 0, 0, context, state)
+    assert count == state.tool_calls == 1
+    assert context['resolved'] and 'failure_kind' not in context
+    decisions = [e for e in state.trace if e['type']=='tool_gateway_decision']
+    assert len(decisions) == 1 and decisions[0]['allowed']
+    assert decisions[0]['tool_call_id'] == 'native-after-correction'
+
+
+def test_context_protocol_retry_can_stop_as_inconclusive(tmp_path):
+    reviewer, completions = verification_reviewer(tmp_path, [
+        response('{"tool_calls":1}'),
+        response('{"status":"inconclusive","reason":"Definition unavailable"}'),
+    ])
+    state = ReviewState(stage='acquire_context')
+    fact, context = unresolved_protocol_fact()
+    reviewer._recover_required_fact(verification_candidate(), fact, 0, 0, context, state)
+    assert not context['resolved'] and state.tool_calls == 0
+    assert context['stop_reason'] == 'Definition unavailable'
+    assert len(completions.requests) == 2
+
+
+def test_protocol_failure_stops_later_facts_and_cannot_be_summarized_as_no_issues(tmp_path):
+    from dataclasses import asdict
+    (tmp_path/'later.py').write_text('changed()\n')
+    candidate = verification_candidate()
+    candidate.required_facts = [
+        RequiredFact(question='Missing definition', source='repository', query='not_found_symbol'),
+        RequiredFact(question='Later context', source='repository', path='later.py'),
+    ]
+    reviewer, completions = verification_reviewer(tmp_path, [
+        response(json.dumps({'candidates':[asdict(candidate)]})),
+        response('{"tool_calls":[{"name":"read_file","arguments":{"path":"later.py"}}]}'),
+        response('{"tool_calls":1}'),
+        response('{"status":"complete","summary":"No issues found"}'),
+    ])
+    result = reviewer.review([{'filename':'example.py','patch':'+changed()'}])
+    assert result.issues == []
+    assert 'tool_protocol_error' in result.summary and 'Context insufficient' in result.summary
+    assert 'No issues found' not in result.summary
+    decision = next(e for e in reviewer.last_trace if e['type']=='candidate_result')
+    assert decision['verdict'] == 'inconclusive' and decision['failure_kind'] == 'tool_protocol_error'
+    assert decision['unresolved_fact_indices'] == [0,1]
+    results = [e for e in reviewer.last_trace if e['type']=='tool_result']
+    assert len(results)==1 and results[0]['name']=='search_code'
+
+
+def test_verify_protocol_retry_failure_stops_even_if_second_response_is_not_tool_shaped(tmp_path):
+    reviewer, completions = verification_reviewer(tmp_path, [response('{"tool_calls":1}'), response('{}')])
+    state = ReviewState(stage='verify')
+    issues, decision = reviewer._verify_candidate('', verification_candidate(), 0, state, [], 0)
+    assert issues == [] and decision['failure_kind'] == 'tool_protocol_error'
+    assert len(completions.requests)==2 and state.tool_calls==0
+
+
+def test_verify_native_calls_take_precedence_over_textual_imitation(tmp_path):
+    (tmp_path/'example.py').write_text('changed()\n')
+    native = SimpleNamespace(id='native-valid', function=SimpleNamespace(name='read_file',arguments='{"path":"example.py"}'))
+    reviewer, completions = verification_reviewer(tmp_path, [
+        response('{"tool_calls":1}', tool_calls=[native]),
+        response(verification_decision(basis='repository')),
+    ])
+    state = ReviewState(stage='verify')
+    issues, decision = reviewer._verify_candidate('File: example.py\nPatch:\n+changed()', verification_candidate(repository=True), 0, state, [], 0)
+    assert len(issues)==1 and state.tool_calls==1
+    assert not any(e['type']=='tool_protocol_error' for e in state.trace)
