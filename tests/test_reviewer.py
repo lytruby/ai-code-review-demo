@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.models import CandidateIssue, EvidenceRef, RequiredFact
-from src.reviewer import OpenAIReviewer, ReviewState
+from src.reviewer import MAX_CANDIDATES_PER_DISCOVERY_PASS, OpenAIReviewer, ReviewState
 
 
 class FakeCompletions:
@@ -154,7 +154,7 @@ def test_reviewer_runs_discover_verify_and_finalize_with_tool(tmp_path):
     assert len(completions.requests) == 7
     assert "Stage: DISCOVER" in completions.requests[0]["messages"][0]["content"]
     discover_prompt = completions.requests[0]["messages"][0]["content"]
-    assert "Return at most 3 candidates" in discover_prompt
+    assert f"Return at most {MAX_CANDIDATES_PER_DISCOVERY_PASS} candidates" in discover_prompt
     assert "ordered by evidence strength" in discover_prompt
     assert "must declare the required facts" in discover_prompt
     assert "tools" not in completions.requests[0]

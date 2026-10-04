@@ -29,10 +29,10 @@ from src.models import (
 from src.tools import READ_FILE_TOOL, SEARCH_CODE_TOOL
 from src.tool_gateway import ToolGateway, ToolProposal
 
-MAX_TOOL_CALLS = 60
+MAX_TOOL_CALLS = 80
 MAX_REQUIRED_FACTS_PER_CANDIDATE = 2
-MAX_CANDIDATES_PER_DISCOVERY_PASS = 3
-MAX_CANDIDATES = 12
+MAX_CANDIDATES_PER_DISCOVERY_PASS = 5
+MAX_CANDIDATES = 16
 MAX_DISCOVER_TURNS = 2
 MAX_DEDUPLICATE_TURNS = 2
 MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
@@ -79,7 +79,7 @@ Find plausible candidate issues in the supplied pull request changes. This is
 an internal discovery step, not the final review. Do not call tools in this
 stage.
 
-Return at most 3 candidates, ordered by evidence strength.
+Return at most 5 candidates, ordered by evidence strength.
 
 Prefer candidates that:
 - point to a concrete changed line or code path,
