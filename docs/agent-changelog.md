@@ -2160,3 +2160,22 @@ prompt_tokens 多 47 个，推测服务端为 JSON mode 注入了额外提示，
 及工具预算耗尽后）保留 JSON mode。工具轮次的文本输出允许被 ```json 代码块
 包裹。OpenAI Responses 路径未做对照，保持不变。全部 171 项测试通过；
 尚未用真实 API 重跑 benchmark。
+
+## 2026-10-04：工具轮次关闭 JSON mode 后重跑 sentry-67876
+
+`kimi-k3-jsonmode-off-sentry67876-v1`，模型、Judge、评分器与上一轮
+`kimi-k3-protocol-sentry67876-v1` 相同，只有代码不同。
+
+| 指标 | 上一轮 | 本轮 |
+|---|---:|---:|
+| 模型调用 | 17 | 38 |
+| 返回原生 tool_calls 的回复 | 0 | 20（共 23 个调用） |
+| 模型发起的工具执行 | 0 | 23（全部经 gateway 允许） |
+| 文本伪工具调用 / tool_protocol_error | 2 / 2 | 0 / 0 |
+| inconclusive 候选 | 4 | 1 |
+| TP / FP / FN | 0 / 4 / 3 | 2 / 4 / 1 |
+| Core F1 | 0 | 44.4% |
+
+模型原生工具通道已恢复，伪调用消失。仍有 1 次验证输出是“说明文字 + ```json
+代码块”，被判为 invalid json，靠一次纠正重试恢复；另有 3 次验证输出数量
+不符的纠正。FP 仍为 4。单例单次结果，评分提升需在更多案例上确认。
