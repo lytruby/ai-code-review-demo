@@ -1,6 +1,7 @@
 from dataclasses import asdict, dataclass, field
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import threading
@@ -1245,7 +1246,6 @@ class OpenAIReviewer(Reviewer):
                 "model": self.model,
                 "messages": list(messages),
                 "max_completion_tokens": max_tokens,
-                "response_format": {"type": "json_object"},
             }
             if self.model.startswith("kimi-k3"):
                 request["reasoning_effort"] = self.reasoning_effort
@@ -1256,6 +1256,11 @@ class OpenAIReviewer(Reviewer):
                     self._chat_tool(READ_FILE_TOOL),
                     self._chat_tool(SEARCH_CODE_TOOL),
                 ]
+            else:
+                # JSON mode makes the model write tool calls as JSON text
+                # instead of native tool_calls (see json-mode-ab-v1), so it is
+                # only enabled on turns without tools.
+                request["response_format"] = {"type": "json_object"}
 
         response = None
         for retry_index in range(self.max_transient_retries + 1):
@@ -1559,6 +1564,10 @@ class OpenAIReviewer(Reviewer):
 
     @staticmethod
     def _parse_json_object(output_text: str) -> dict:
+        # Tool turns run without JSON mode, so tolerate a fenced JSON block.
+        fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", output_text, re.S)
+        if fenced:
+            output_text = fenced.group(1)
         try:
             data = json.loads(output_text)
         except json.JSONDecodeError as error:

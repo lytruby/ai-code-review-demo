@@ -161,6 +161,11 @@ def test_reviewer_runs_discover_verify_and_finalize_with_tool(tmp_path):
     assert completions.requests[4]["tools"][0]["function"]["name"] == "read_file"
     assert completions.requests[4]["tools"][1]["function"]["name"] == "search_code"
     assert "Stage: FINALIZE" in completions.requests[6]["messages"][0]["content"]
+    # JSON mode is only sent on turns without tools.
+    assert completions.requests[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in completions.requests[4]
+    assert "response_format" not in completions.requests[5]
+    assert completions.requests[6]["response_format"] == {"type": "json_object"}
 
     verify_after_tool = completions.requests[5]["messages"]
     assert verify_after_tool[-1]["role"] == "tool"
@@ -1718,3 +1723,11 @@ def test_verify_native_calls_take_precedence_over_textual_imitation(tmp_path):
     issues, decision = reviewer._verify_candidate('File: example.py\nPatch:\n+changed()', verification_candidate(repository=True), 0, state, [], 0)
     assert len(issues)==1 and state.tool_calls==1
     assert not any(e['type']=='tool_protocol_error' for e in state.trace)
+
+
+@pytest.mark.parametrize(
+    "output",
+    ['```json\n{"status": "complete"}\n```', '```\n{"status": "complete"}\n```'],
+)
+def test_tool_turn_output_accepts_fenced_json(output):
+    assert OpenAIReviewer._parse_json_object(output) == {"status": "complete"}

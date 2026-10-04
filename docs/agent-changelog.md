@@ -2145,3 +2145,18 @@ Core F1=0（上一轮单例 33.3%）。8 个候选中 4 个输出、4 个 inconc
 单次评分没有改善，不能把协议恢复边界修复等同于审查能力改善。其余证据
 不足还暴露出自动检索首条命中不相关的问题。建议下一步隔离验证探索请求
 协议与检索相关性，仍保持 benchmark 分母不变。详见实验目录 audit.md。
+
+## 2026-10-04：JSON mode 对照实验，工具轮次关闭 JSON mode
+
+`json-mode-ab-v1` 用 `evals/tool_protocol_ab.py` 重放 raw-response-audit-v1
+保存的同一请求，只切换 `response_format`，各 3 次，不执行工具。JSON mode
+开启：0/3 返回原生 tool_calls，finish_reason 全为 stop，content 中是伪工具
+调用或模型自行编造的搜索结果。JSON mode 关闭：3/3 返回原生 tool_calls，
+5 个调用参数全部符合 schema。样本少（Fisher p≈0.1），方向一致。开启时
+prompt_tokens 多 47 个，推测服务端为 JSON mode 注入了额外提示，未证实。
+
+据此修改 Chat Completions 请求：附带工具的轮次不再传
+`response_format: json_object`，无工具轮次（探索、去重、取证收尾、总结
+及工具预算耗尽后）保留 JSON mode。工具轮次的文本输出允许被 ```json 代码块
+包裹。OpenAI Responses 路径未做对照，保持不变。全部 171 项测试通过；
+尚未用真实 API 重跑 benchmark。
