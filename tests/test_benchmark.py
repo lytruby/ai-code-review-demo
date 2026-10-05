@@ -279,3 +279,33 @@ def test_discover_only_settings_reach_runner_and_report(tmp_path):
     assert calls[0]["reviewer_settings"] == {"candidates_per_pass": 3}
     assert summary["configuration"]["review_settings"]["discover_only"] is True
     assert "Discover-only run" in (run / "report.md").read_text(encoding="utf-8")
+
+
+def test_jobs_review_cases_concurrently(tmp_path):
+    data, cases = catalog(tmp_path, count=3)
+    run = tmp_path / "run"
+    import threading
+    barrier = threading.Barrier(3, timeout=5)
+
+    def prepare(case, data_dir):
+        fixture = tmp_path / "fixtures" / case["id"]
+        write_json(fixture / "metadata.json", {"id": case["id"]})
+        write_json(fixture / "changes.json", [])
+        return fixture
+
+    def runner(fixture, run_dir, **options):
+        # Each review waits for the others, so this only finishes if all three overlap.
+        barrier.wait()
+        write_json(run_dir / fixture.name / "result.json", result("bug"))
+
+    summary = asyncio.run(run_benchmark(
+        data, run, cases, "kimi", judge_factory=FakeJudge, review_runner=runner,
+        fixture_preparer=prepare, jobs=3))
+
+    assert summary["scored_cases"] == 3
+
+
+def test_jobs_must_be_positive(tmp_path):
+    data, cases = catalog(tmp_path)
+    with pytest.raises(ValueError, match="jobs"):
+        asyncio.run(run_benchmark(data, tmp_path / "run", cases, "kimi", jobs=0))

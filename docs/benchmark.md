@@ -70,6 +70,17 @@ Precision / F1 没有意义。每个案例约 5–6 次模型调用，完整 rev
 确认 discover 有提升后，仍需要用完整 review 小规模复核 verify 和 FP。
 `--candidates-per-pass` 和 `--max-candidates` 只能调低，不能超过代码中的上限。
 
+## 并行跑案例
+
+`--jobs N` 同时跑 N 个案例（默认 1，即串行）。每个案例的请求和结果不变，花费
+相同，只缩短总耗时。受 Kimi 并发限制，建议先用 4，出现大量超时或 429 再调低。
+改动 `evals/` 下的代码会改变运行配置，所以正在跑的实验不要在中途更新代码。
+
+```bash
+uv run python -m evals.benchmark run --provider kimi --run-name val-x-r1 \
+  --discover-only --jobs 4 --case-id ...
+```
+
 ## 分数含义
 
 本地 adapter 直接使用固定版本官方源码中的 `evaluate_review` 和 `score_tools`，

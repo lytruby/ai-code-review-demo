@@ -174,7 +174,9 @@ def review_usage(responses: list[dict]) -> dict:
 async def run_benchmark(data_dir: Path, run_dir: Path, cases: list[dict], provider: str,
                         source_run: Path | None = None, judge_factory=BenchmarkJudge,
                         review_runner=run_case, fixture_preparer=prepare_fixture,
-                        review_settings: dict | None = None) -> dict:
+                        review_settings: dict | None = None, jobs: int = 1) -> dict:
+    if jobs < 1:
+        raise ValueError("jobs must be at least 1")
     review_settings = review_settings or {}
     catalog = load_catalog(data_dir)
     identity = {"dataset_sha256": digest(catalog), "scorer": SCORER_VERSION,
@@ -188,8 +190,11 @@ async def run_benchmark(data_dir: Path, run_dir: Path, cases: list[dict], provid
         else:
             write_json(manifest_path, {**identity, "created_at": datetime.now(timezone.utc).isoformat()})
         judge = None
-        try:
-            for index, case in enumerate(cases, 1):
+        slots = asyncio.Semaphore(jobs)
+
+        async def run_one(index: int, case: dict) -> None:
+            nonlocal judge
+            async with slots:
                 case_dir = run_dir / case["id"]
                 started = time.monotonic()
                 stage = "review"
@@ -213,21 +218,26 @@ async def run_benchmark(data_dir: Path, run_dir: Path, cases: list[dict], provid
                         write_json(lock_path, inputs)
                         if not result_path.exists():
                             reviewer_settings = {k: v for k, v in review_settings.items() if k != "discover_only"}
-                            review_runner(fixture, run_dir, repository_cache=REPOSITORIES_DIR, provider=provider,
-                                          **({"reviewer_settings": reviewer_settings} if reviewer_settings else {}),
-                                          **({"discover_only": True} if review_settings.get("discover_only") else {}))
+                            # The review is synchronous; a worker thread lets other cases proceed.
+                            await asyncio.to_thread(
+                                review_runner, fixture, run_dir, repository_cache=REPOSITORIES_DIR, provider=provider,
+                                **({"reviewer_settings": reviewer_settings} if reviewer_settings else {}),
+                                **({"discover_only": True} if review_settings.get("discover_only") else {}))
                     stage = "judge"
                     result = read_json(result_path)
                     golden = read_json(data_dir / "golden" / f"{case['id']}.json")
                     if judge is None:
                         judge = judge_factory()
-                    print(f"  scoring {len(result['issues'])} issues × {len(golden['comments'])} golden (cached comparisons reused)", flush=True)
+                    print(f"  {case['id']}: scoring {len(result['issues'])} issues × {len(golden['comments'])} golden (cached comparisons reused)", flush=True)
                     await score_case(result, golden, case_dir, judge)
                     write_json(case_dir / "status.json", {"status": "scored", "last_attempt_seconds": round(time.monotonic() - started, 2)})
                 except Exception as error:
                     write_json(case_dir / "status.json", {"status": f"{stage}_failed", "error": str(error), "last_attempt_seconds": round(time.monotonic() - started, 2)})
-                    print(f"  {stage} failed: {error}", flush=True)
+                    print(f"  {case['id']}: {stage} failed: {error}", flush=True)
                 report(data_dir, run_dir)
+
+        try:
+            await asyncio.gather(*(run_one(index, case) for index, case in enumerate(cases, 1)))
         finally:
             if judge is not None and hasattr(judge, "client"):
                 await judge.client.close()
@@ -252,6 +262,8 @@ def main() -> None:
     parser.add_argument("--candidates-per-pass", type=int, help="Override the discovery per-pass candidate limit")
     parser.add_argument("--max-candidates", type=int, help="Override the candidate cap after deduplication")
     parser.add_argument("--discovery-passes", nargs="+", help="Run only these discovery passes (by name)")
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="Review and score up to this many cases concurrently; cost is unchanged, provider rate limits apply")
     args = parser.parse_args()
     review_settings = {}
     if args.discover_only:
@@ -264,6 +276,8 @@ def main() -> None:
         review_settings["discovery_passes"] = args.discovery_passes
     if review_settings and args.source_run:
         parser.error("Review settings cannot be combined with --source-run")
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_name):
         parser.error("Invalid run name")
     try:
@@ -294,7 +308,7 @@ def main() -> None:
             if not args.source_run and not os.environ.get("MOONSHOT_API_KEY" if args.provider == "kimi" else "OPENAI_API_KEY"):
                 raise ValueError("Review provider API key is missing")
             summary = asyncio.run(run_benchmark(args.data, run_dir, cases, args.provider, args.source_run,
-                                                review_settings=review_settings))
+                                                review_settings=review_settings, jobs=args.jobs))
         print(f"Scored {summary['scored_cases']}/{summary['total_cases']} PRs; report: {run_dir / 'report.md'}")
         if not summary["selection_complete"]:
             raise SystemExit(1)
