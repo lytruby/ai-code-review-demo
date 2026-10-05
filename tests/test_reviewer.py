@@ -1772,3 +1772,41 @@ def test_verify_finalizes_immediately_when_tool_budget_is_spent(tmp_path):
     request = completions.requests[0]
     assert "tools" not in request
     assert "budget is exhausted" in request["messages"][-1]["content"]
+
+
+def test_discover_only_returns_unverified_candidates_with_configured_limits(tmp_path):
+    candidate = (
+        '{"file":"example.py","severity":"high",'
+        '"claim":"Possible division by zero",'
+        '"evidence":[{"side":"after","text":"return a / b"}],'
+        '"required_facts":[]}'
+    )
+    completions = FakeCompletions([response(f'{{"candidates":[{candidate}]}}')])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    reviewer = OpenAIReviewer(
+        client=client,
+        repository_root=tmp_path,
+        model="test",
+        candidates_per_pass=3,
+        max_candidates=8,
+    )
+
+    result = reviewer.discover_only(
+        [{"filename": "example.py", "patch": "+    return a / b"}]
+    )
+
+    assert result.status == "complete"
+    assert [issue.description for issue in result.issues] == ["Possible division by zero"]
+    assert "Return at most 3 candidates" in completions.requests[0]["messages"][0]["content"]
+    assert not any("Stage: VERIFY" in r["messages"][0]["content"] for r in completions.requests)
+
+
+def test_reviewer_rejects_limits_above_supported_maximum(tmp_path):
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions([])))
+    with pytest.raises(ValueError):
+        OpenAIReviewer(
+            client=client,
+            repository_root=tmp_path,
+            model="test",
+            candidates_per_pass=MAX_CANDIDATES_PER_DISCOVERY_PASS + 1,
+        )

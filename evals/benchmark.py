@@ -32,7 +32,7 @@ def select_cases(manifest: dict, ids: list[str] | None = None, limit: int | None
     return cases[:limit] if limit else cases
 
 
-def configuration(provider: str, source_run: Path | None) -> dict:
+def configuration(provider: str, source_run: Path | None, review_settings: dict | None = None) -> dict:
     # Record only non-secret settings. Never serialize the environment wholesale.
     names = ("LLM_MODEL", "OPENAI_MODEL", "KIMI_MODEL", "LLM_REASONING_EFFORT",
              "KIMI_THINKING", "LLM_MAX_COMPLETION_TOKENS", "LLM_DISCOVER_MAX_COMPLETION_TOKENS",
@@ -55,6 +55,7 @@ def configuration(provider: str, source_run: Path | None) -> dict:
     return {"provider": provider, "review_model": model if source_run is None else "historical-see-source-run",
             "settings": {n: os.environ.get(n, defaults[n]) for n in names}, "code_sha256": digest(code),
             "source_run": str(source_run.resolve()) if source_run else None,
+            "review_settings": review_settings or {},
             "endpoint_config_sha256": digest({k: os.environ.get(k) for k in ("OPENAI_BASE_URL", "KIMI_BASE_URL", "LLM_BASE_URL")})}
 
 
@@ -124,6 +125,8 @@ def report(data_dir: Path, run_dir: Path) -> dict:
     lines = ["# Local benchmark evaluation", "", f"Scored **{len(evaluations)}/{len(rows)}** PRs; selected {len(selected)}.",
              "Full benchmark complete." if summary["complete"] else "**Partial results: these scores describe completed cases only.**", "",
              "Pinned upstream scoring; structured issue input and local OpenAI judge. Not an official leaderboard run.", "",
+             *(["**Discover-only run:** issues are unverified candidates. Recall is candidate coverage of the golden issues; precision and F1 are not meaningful.", ""]
+               if run_manifest["configuration"].get("review_settings", {}).get("discover_only") else []),
              "| Profile | TP | FP | FN | Precision | Recall | F1 | F2 |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for name, m in summary["profiles"].items():
         lines.append(f"| {name} | {m['tp']} | {m['fp']} | {m['fn']} | {m['precision']:.1%} | {m['recall']:.1%} | {m['f1']:.1%} | {m['fbeta']:.1%} |")
@@ -170,10 +173,12 @@ def review_usage(responses: list[dict]) -> dict:
 
 async def run_benchmark(data_dir: Path, run_dir: Path, cases: list[dict], provider: str,
                         source_run: Path | None = None, judge_factory=BenchmarkJudge,
-                        review_runner=run_case, fixture_preparer=prepare_fixture) -> dict:
+                        review_runner=run_case, fixture_preparer=prepare_fixture,
+                        review_settings: dict | None = None) -> dict:
+    review_settings = review_settings or {}
     catalog = load_catalog(data_dir)
     identity = {"dataset_sha256": digest(catalog), "scorer": SCORER_VERSION,
-                "case_ids": [c["id"] for c in cases], "configuration": configuration(provider, source_run)}
+                "case_ids": [c["id"] for c in cases], "configuration": configuration(provider, source_run, review_settings)}
     with run_lock(run_dir):
         manifest_path = run_dir / "run.json"
         if manifest_path.exists():
@@ -207,7 +212,10 @@ async def run_benchmark(data_dir: Path, run_dir: Path, cases: list[dict], provid
                             raise ValueError("Locked fixture changed; choose a new run name")
                         write_json(lock_path, inputs)
                         if not result_path.exists():
-                            review_runner(fixture, run_dir, repository_cache=REPOSITORIES_DIR, provider=provider)
+                            reviewer_settings = {k: v for k, v in review_settings.items() if k != "discover_only"}
+                            review_runner(fixture, run_dir, repository_cache=REPOSITORIES_DIR, provider=provider,
+                                          **({"reviewer_settings": reviewer_settings} if reviewer_settings else {}),
+                                          **({"discover_only": True} if review_settings.get("discover_only") else {}))
                     stage = "judge"
                     result = read_json(result_path)
                     golden = read_json(data_dir / "golden" / f"{case['id']}.json")
@@ -239,7 +247,20 @@ def main() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--fixtures", action="store_true", help="Also fetch selected PR inputs during prepare (no LLM calls)")
     parser.add_argument("--source-run", type=Path, help="Score existing results without rerunning review; historical configuration is not inferred")
+    parser.add_argument("--discover-only", action="store_true",
+                        help="Run only discovery and deduplication and score the unverified candidates: recall is candidate coverage, precision is not meaningful")
+    parser.add_argument("--candidates-per-pass", type=int, help="Override the discovery per-pass candidate limit")
+    parser.add_argument("--max-candidates", type=int, help="Override the candidate cap after deduplication")
     args = parser.parse_args()
+    review_settings = {}
+    if args.discover_only:
+        review_settings["discover_only"] = True
+    if args.candidates_per_pass is not None:
+        review_settings["candidates_per_pass"] = args.candidates_per_pass
+    if args.max_candidates is not None:
+        review_settings["max_candidates"] = args.max_candidates
+    if review_settings and args.source_run:
+        parser.error("Review settings cannot be combined with --source-run")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_name):
         parser.error("Invalid run name")
     try:
@@ -269,7 +290,8 @@ def main() -> None:
                 raise ValueError("OPENAI_API_KEY is required for the judge")
             if not args.source_run and not os.environ.get("MOONSHOT_API_KEY" if args.provider == "kimi" else "OPENAI_API_KEY"):
                 raise ValueError("Review provider API key is missing")
-            summary = asyncio.run(run_benchmark(args.data, run_dir, cases, args.provider, args.source_run))
+            summary = asyncio.run(run_benchmark(args.data, run_dir, cases, args.provider, args.source_run,
+                                                review_settings=review_settings))
         print(f"Scored {summary['scored_cases']}/{summary['total_cases']} PRs; report: {run_dir / 'report.md'}")
         if not summary["selection_complete"]:
             raise SystemExit(1)

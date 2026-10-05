@@ -52,6 +52,24 @@ uv run python -m evals.benchmark run --provider kimi --run-name rescore-v1 \
 这不会运行 reviewer，也不会覆盖旧产物。历史 review 的模型配置标记为未知，
 来源目录会保存；不能把新评分当作当前工作区 agent 的一次新运行。
 
+## 只评测 discover（低成本）
+
+只改 discover 时，可以只跑 discover 和去重，把未验证的候选直接交给 Judge
+和 golden 匹配，不跑 verify / finalize，也不 checkout 仓库：
+
+```bash
+uv run python -m evals.benchmark run --provider kimi --run-name disc-pass5-r1 \
+  --discover-only --case-id ...
+# 用同一份代码模拟旧配置（每个 pass 3 个候选、上限 8）
+uv run python -m evals.benchmark run --provider kimi --run-name disc-pass3-r1 \
+  --discover-only --candidates-per-pass 3 --max-candidates 8 --case-id ...
+```
+
+报告里的 Recall 表示候选对 golden 的覆盖率，是完整 review 召回的上限；
+Precision / F1 没有意义。每个案例约 5–6 次模型调用，完整 review 约 25–40 次。
+确认 discover 有提升后，仍需要用完整 review 小规模复核 verify 和 FP。
+`--candidates-per-pass` 和 `--max-candidates` 只能调低，不能超过代码中的上限。
+
 ## 分数含义
 
 本地 adapter 直接使用固定版本官方源码中的 `evaluate_review` 和 `score_tools`，

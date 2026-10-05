@@ -112,6 +112,38 @@ def test_run_case_passes_explicit_provider_to_reviewer(tmp_path):
     assert observed["provider"] == "openai"
 
 
+def test_run_case_discover_only_skips_checkout(tmp_path):
+    fixture = make_fixture(tmp_path)
+    observed = {}
+
+    def fail_checkout(metadata, destination):
+        raise AssertionError("discover-only must not check out the repository")
+
+    class FakeReviewer:
+        def __init__(self, repository_root, candidates_per_pass):
+            observed["candidates_per_pass"] = candidates_per_pass
+            self.last_trace = []
+
+        def review(self, changes):
+            raise AssertionError("discover-only must not run the full review")
+
+        def discover_only(self, changes):
+            return ReviewResult(summary="Discovery only: 0 unverified candidate(s).")
+
+    result_path = run_case(
+        fixture,
+        tmp_path / "runs",
+        reviewer_factory=FakeReviewer,
+        checkout=fail_checkout,
+        repository_cache=tmp_path / "cache",
+        reviewer_settings={"candidates_per_pass": 3},
+        discover_only=True,
+    )
+
+    assert result_path.is_file()
+    assert observed["candidates_per_pass"] == 3
+
+
 def test_checkout_pr_rejects_changed_head(tmp_path, monkeypatch):
     outputs = iter(["", "", "", "different-head"])
 

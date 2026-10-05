@@ -79,7 +79,7 @@ Find plausible candidate issues in the supplied pull request changes. This is
 an internal discovery step, not the final review. Do not call tools in this
 stage.
 
-Return at most 5 candidates, ordered by evidence strength.
+Return at most {max_candidates} candidates, ordered by evidence strength.
 
 Prefer candidates that:
 - point to a concrete changed line or code path,
@@ -353,7 +353,21 @@ class Reviewer:
 
 
 class OpenAIReviewer(Reviewer):
-    def __init__(self, client=None, repository_root=None, model=None, provider=None):
+    def __init__(
+        self,
+        client=None,
+        repository_root=None,
+        model=None,
+        provider=None,
+        candidates_per_pass=MAX_CANDIDATES_PER_DISCOVERY_PASS,
+        max_candidates=MAX_CANDIDATES,
+    ):
+        if not 1 <= candidates_per_pass <= MAX_CANDIDATES_PER_DISCOVERY_PASS:
+            raise ValueError("candidates_per_pass is out of range")
+        if not 1 <= max_candidates <= MAX_CANDIDATES:
+            raise ValueError("max_candidates is out of range")
+        self.candidates_per_pass = candidates_per_pass
+        self.max_candidates = max_candidates
         configured_model = model or os.environ.get("LLM_MODEL")
         self.provider = self._resolve_provider(provider, configured_model)
         self.request_timeout = float(os.environ.get("LLM_TIMEOUT", "120"))
@@ -492,6 +506,35 @@ class OpenAIReviewer(Reviewer):
             status="complete",
         )
 
+    def discover_only(self, changes) -> ReviewResult:
+        """Run only discovery and deduplication, returning candidates as issues.
+
+        Used to measure candidate coverage of known issues cheaply; the claims
+        are unverified and must not be published as a review.
+        """
+        state = ReviewState()
+        self.last_state = state
+        self.last_trace = state.trace
+        code_changes = "\n\n".join(
+            f"File: {change['filename']}\nPatch:\n{change['patch']}"
+            for change in changes
+        )
+        state.candidates = self._discover(code_changes, state)
+        state.stage = "complete"
+        return ReviewResult(
+            summary=f"Discovery only: {len(state.candidates)} unverified candidate(s).",
+            issues=[
+                ReviewIssue(
+                    file=candidate.file,
+                    severity=candidate.severity,
+                    description=candidate.claim,
+                    suggestion="",
+                )
+                for candidate in state.candidates
+            ],
+            status="complete",
+        )
+
     def _discover(self, code_changes: str, state: ReviewState) -> list[CandidateIssue]:
         pass_candidates = []
         pass_rejection_counts = []
@@ -523,7 +566,7 @@ class OpenAIReviewer(Reviewer):
 
         merged = []
         seen = set()
-        for candidate_offset in range(MAX_CANDIDATES_PER_DISCOVERY_PASS):
+        for candidate_offset in range(self.candidates_per_pass):
             for candidates in pass_candidates:
                 if candidate_offset >= len(candidates):
                     continue
@@ -538,7 +581,7 @@ class OpenAIReviewer(Reviewer):
         state.stage = "deduplicate"
         merged = self._deduplicate_candidates(merged, state)
         after_semantic_dedup = len(merged)
-        merged = merged[:MAX_CANDIDATES]
+        merged = merged[:self.max_candidates]
         state.stage = "discover"
 
         state.trace.append(
@@ -549,7 +592,7 @@ class OpenAIReviewer(Reviewer):
                 "candidate_count_before_semantic_dedup": before_semantic_dedup,
                 "candidate_count_after_semantic_dedup": after_semantic_dedup,
                 "candidate_count_truncated": max(
-                    0, after_semantic_dedup - MAX_CANDIDATES
+                    0, after_semantic_dedup - self.max_candidates
                 ),
                 "rejected_candidate_count": sum(pass_rejection_counts),
                 "pass_candidate_counts": {
@@ -672,7 +715,9 @@ class OpenAIReviewer(Reviewer):
         messages = [
             {
                 "role": "system",
-                "content": f"{REVIEW_PROMPT}\n\n{DISCOVER_PROMPT}",
+                "content": f"{REVIEW_PROMPT}\n\n" + DISCOVER_PROMPT.replace(
+                    "{max_candidates}", str(self.candidates_per_pass)
+                ),
             },
             {
                 "role": "user",
@@ -693,7 +738,7 @@ class OpenAIReviewer(Reviewer):
                 candidates, rejections = self._parse_candidate_batch(
                     message.content or "",
                     code_changes,
-                    max_candidates=MAX_CANDIDATES_PER_DISCOVERY_PASS,
+                    max_candidates=self.candidates_per_pass,
                 )
             except ValueError as error:
                 self._append_feedback(messages, state, f"Invalid DISCOVER output: {error}")

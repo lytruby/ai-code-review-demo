@@ -254,3 +254,28 @@ def test_review_usage_splits_cached_prompt_tokens():
     ])
     assert usage == {"prompt_tokens": 150, "cached_prompt_tokens": 80,
                      "completion_tokens": 15, "uncached_prompt_tokens": 70}
+
+
+def test_discover_only_settings_reach_runner_and_report(tmp_path):
+    data, cases = catalog(tmp_path)
+    run = tmp_path / "run"
+    calls = []
+
+    def prepare(case, data_dir):
+        fixture = tmp_path / "fixtures" / case["id"]
+        write_json(fixture / "metadata.json", {"id": case["id"]})
+        write_json(fixture / "changes.json", [])
+        return fixture
+
+    def runner(fixture, run_dir, **options):
+        calls.append(options)
+        write_json(run_dir / fixture.name / "result.json", result("bug"))
+
+    summary = asyncio.run(run_benchmark(
+        data, run, cases[:1], "kimi", judge_factory=FakeJudge, review_runner=runner,
+        fixture_preparer=prepare, review_settings={"discover_only": True, "candidates_per_pass": 3}))
+
+    assert calls[0]["discover_only"] is True
+    assert calls[0]["reviewer_settings"] == {"candidates_per_pass": 3}
+    assert summary["configuration"]["review_settings"]["discover_only"] is True
+    assert "Discover-only run" in (run / "report.md").read_text(encoding="utf-8")

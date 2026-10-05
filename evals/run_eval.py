@@ -169,17 +169,22 @@ def run_case(
     checkout: Callable[[dict, Path], None] = checkout_pr,
     repository_cache: Path | None = None,
     provider: str | None = None,
+    reviewer_settings: dict | None = None,
+    discover_only: bool = False,
 ) -> Path:
     metadata, changes = load_fixture(fixture_dir)
     case_id = metadata["id"]
 
     def review_repository(repository_root: Path):
-        reviewer_options = {"repository_root": repository_root}
+        reviewer_options = {"repository_root": repository_root, **(reviewer_settings or {})}
         if provider is not None:
             reviewer_options["provider"] = provider
         reviewer = reviewer_factory(**reviewer_options)
         try:
-            result = reviewer.review(changes)
+            if discover_only:
+                result = reviewer.discover_only(changes)
+            else:
+                result = reviewer.review(changes)
         except Exception as error:
             error_path = save_failure(
                 run_dir,
@@ -192,7 +197,7 @@ def run_case(
             ) from error
         return result, getattr(reviewer, "last_trace", [])
 
-    if repository_cache is not None:
+    if repository_cache is not None and not discover_only:
         repository_root = prepare_cached_repository(
             metadata,
             repository_cache,
@@ -202,7 +207,9 @@ def run_case(
     else:
         with tempfile.TemporaryDirectory(prefix=f"code-review-{case_id}-") as temp_dir:
             repository_root = Path(temp_dir)
-            checkout(metadata, repository_root)
+            # Discovery reads only the diff, so it needs no checkout.
+            if not discover_only:
+                checkout(metadata, repository_root)
             result, trace = review_repository(repository_root)
 
     return save_result(
