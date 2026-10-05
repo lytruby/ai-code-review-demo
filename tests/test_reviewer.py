@@ -14,6 +14,9 @@ def single_discovery_sample(monkeypatch, request):
     # covered by its own tests.
     if "real_sample_default" not in request.keywords:
         monkeypatch.setattr(src.reviewer, "DISCOVERY_SAMPLES", 1)
+    # Scripted responses are consumed in order, so discovery runs serially here.
+    if "parallel_discovery" not in request.keywords:
+        monkeypatch.setattr(src.reviewer, "DISCOVERY_WORKERS", 1)
 
 
 class FakeCompletions:
@@ -1896,3 +1899,49 @@ def test_default_review_samples_discovery_twice_with_scaled_budgets(tmp_path):
     assert reviewer.discovery_samples == 2
     assert reviewer.max_candidates == 2 * MAX_CANDIDATES
     assert reviewer.max_tool_calls == 5 * reviewer.max_candidates
+
+
+@pytest.mark.parallel_discovery
+def test_discovery_warms_cache_then_runs_remaining_passes_concurrently(tmp_path):
+    import threading
+
+    later_passes = threading.Barrier(3, timeout=5)
+    events = []
+    lock = threading.Lock()
+
+    class PassAwareCompletions:
+        requests = []
+
+        def create(self, **request):
+            content = request["messages"][1]["content"]
+            if "Candidates:" in content:
+                return response('{"groups":[]}')
+            pass_name = content.split("Discovery pass: ", 1)[1].split("\n", 1)[0]
+            with lock:
+                first = not events
+                events.append(("start", pass_name))
+            if not first:
+                # Three later passes must be in flight together for this to return.
+                later_passes.wait()
+            with lock:
+                events.append(("end", pass_name))
+            claim = f"Defect found by {pass_name}"
+            return response(
+                '{"candidates":[{"file":"example.py","severity":"medium",'
+                f'"claim":"{claim}",'
+                '"evidence":[{"file":"example.py","side":"after","text":"x = 1"}],'
+                '"required_facts":[]}]}'
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=PassAwareCompletions()))
+    reviewer = OpenAIReviewer(client=client, repository_root=tmp_path, model="test")
+    reviewer.discovery_samples = 1
+    reviewer.discovery_passes = reviewer.discovery_passes[:4]
+    state = ReviewState()
+
+    reviewer._discover("File: example.py\nPatch:\n+x = 1", state)
+
+    # The first pass finishes before any other starts, so its prefix is cached.
+    assert events[:2] == [("start", "correctness"), ("end", "correctness")]
+    stage = next(e for e in state.trace if e.get("type") == "stage_result" and e["stage"] == "discover")
+    assert list(stage["pass_candidate_counts"]) == [name for name, _ in reviewer.discovery_passes]

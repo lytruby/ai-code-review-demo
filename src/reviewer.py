@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 import json
 import os
@@ -36,6 +37,9 @@ MAX_CANDIDATES = 16
 MAX_DISCOVERY_SAMPLES = 3
 # Two samples raised discover-only core recall on unseen cases from 24 to 28 of 40.
 DISCOVERY_SAMPLES = 2
+# Discovery requests are independent, so after the first one has cached the
+# shared prefix the rest run concurrently.
+DISCOVERY_WORKERS = 4
 MAX_DISCOVER_TURNS = 2
 MAX_DEDUPLICATE_TURNS = 2
 MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
@@ -355,6 +359,7 @@ class ReviewState:
     tool_calls: int = 0
     api_attempts: int = 0
     tool_gateway: ToolGateway | None = field(default=None, repr=False)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 class Reviewer:
@@ -581,11 +586,11 @@ class OpenAIReviewer(Reviewer):
             for sample in range(self.discovery_samples)
             for name, prompt in self.discovery_passes
         ]
-        for run_name, pass_name, focus_prompt in runs:
+
+        def run_pass(run):
+            run_name, pass_name, focus_prompt = run
             try:
-                candidates, rejection_count = self._discover_pass(
-                    code_changes, state, pass_name, focus_prompt
-                )
+                return self._discover_pass(code_changes, state, pass_name, focus_prompt)
             except ValueError as error:
                 state.trace.append(
                     {
@@ -595,9 +600,23 @@ class OpenAIReviewer(Reviewer):
                         "error": str(error),
                     }
                 )
+                return None
+
+        # The first request runs alone so the shared system prompt and diff
+        # are cached before the remaining requests reuse them.
+        outcomes = [run_pass(runs[0])]
+        workers = min(DISCOVERY_WORKERS, len(runs) - 1)
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                outcomes.extend(executor.map(run_pass, runs[1:]))
+        else:
+            outcomes.extend(run_pass(run) for run in runs[1:])
+        for outcome in outcomes:
+            if outcome is None:
                 pass_candidates.append([])
                 pass_rejection_counts.append(0)
                 continue
+            candidates, rejection_count = outcome
             successful_passes += 1
             pass_candidates.append(candidates)
             pass_rejection_counts.append(rejection_count)
@@ -1293,8 +1312,9 @@ class OpenAIReviewer(Reviewer):
         raise ValueError("FINALIZE did not finish within the workflow turn limit")
 
     def _request(self, messages: list[dict], state: ReviewState, allow_tools: bool):
-        if state.model_turns >= self.max_model_turns:
-            raise ValueError("AI review reached the workflow turn limit")
+        with state.lock:
+            if state.model_turns >= self.max_model_turns:
+                raise ValueError("AI review reached the workflow turn limit")
 
         max_tokens = (
             self.discover_max_completion_tokens
@@ -1359,7 +1379,8 @@ class OpenAIReviewer(Reviewer):
 
         response = None
         for retry_index in range(self.max_transient_retries + 1):
-            state.api_attempts += 1
+            with state.lock:
+                state.api_attempts += 1
             attempt = retry_index + 1
             total_attempts = self.max_transient_retries + 1
             started_at = time.monotonic()
@@ -1442,7 +1463,9 @@ class OpenAIReviewer(Reviewer):
                 "previous_response_id": response_id,
                 "sent_message_count": len(messages),
             }
-        state.model_turns += 1
+        with state.lock:
+            state.model_turns += 1
+            turn = state.model_turns
         if self.use_responses_api:
             message, finish_reason = self._responses_message(response)
         else:
@@ -1454,7 +1477,7 @@ class OpenAIReviewer(Reviewer):
             {
                 "type": "model_response",
                 "stage": state.stage,
-                "turn": state.model_turns,
+                "turn": turn,
                 "finish_reason": finish_reason,
                 "usage": self._serialize_usage(getattr(response, "usage", None)),
                 "content": message.content,
