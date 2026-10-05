@@ -2374,3 +2374,26 @@ pass5 的两次都高于 pass3 的两次，合计 92/150 vs 76/150（+10.7 个�
 
 不能下的结论：只测了 discover 上限，verify 是否保留这些候选、FP 变化未知；
 sentry-benchmark-5 在 pass3-r1 首次 Judge 去重失败，续跑后完成。
+
+## 2026-10-05：新增安全 discover pass（disc-sec-r1 / r2）
+
+代码 35cd1d4：在 pass5 基础上新增第 5 个 pass `security`（SQL/命令/路径注入、
+SSRF、XSS、认证授权与 CSRF/CORS/framing 防护削弱、可绕过的 origin/referer
+校验、敏感信息泄露）。代码默认 `MAX_CANDIDATES` → 20、`MAX_TOOL_CALLS` → 100；
+本次 discover-only 用 `--max-candidates 16` 与 pass5 保持同一上限。同样 15 个
+案例各跑 2 次。
+
+| | pass5 r1 | pass5 r2 | sec r1 | sec r2 |
+|---|---:|---:|---:|---:|
+| Core TP / 75 | 44 | 48 | 49 | 51 |
+| Recall | 58.7% | 64.0% | 65.3% | 68.0% |
+| prompt（未命中 + 命中） | 78.4 万 | 78.3 万 | 96.8 万 | 97.1 万 |
+| 输出 | 11.2 万 | 10.7 万 | 12.5 万 | 12.9 万 |
+
+合计 100/150（66.7%）vs 92/150（61.3%），两次都不低于 pass5 的两次。
+discourse-benchmark-4 的 8 条 core golden 从每次 2 条升到 4 条（命中了
+ALLOWALL、referer XSS、origin 校验等中的一部分）。discover 成本 prompt
+约 +24%、输出约 +16%，每案例调用 5 → 6 次。
+
+不能下的结论：安全 pass 是看着这 15 个案例的漏报设计的，提升可能部分来自
+对这批案例的拟合，需要换一批未看过的案例复核；仍只测了 discover 上限。
