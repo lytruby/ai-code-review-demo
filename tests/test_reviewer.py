@@ -1814,3 +1814,19 @@ def test_reviewer_rejects_limits_above_supported_maximum(tmp_path):
             model="test",
             candidates_per_pass=MAX_CANDIDATES_PER_DISCOVERY_PASS + 1,
         )
+
+
+def test_reviewer_runs_only_selected_discovery_passes(tmp_path):
+    completions = FakeCompletions([response('{"candidates":[]}')], auto_empty_state_pass=False)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    reviewer = OpenAIReviewer(
+        client=client, repository_root=tmp_path, model="test", discovery_passes=["correctness"]
+    )
+
+    result = reviewer.discover_only([{"filename": "example.py", "patch": "+x = 1"}])
+
+    assert result.issues == []
+    assert len(completions.requests) == 1
+    assert "Discovery pass: correctness" in completions.requests[0]["messages"][1]["content"]
+    with pytest.raises(ValueError):
+        OpenAIReviewer(client=client, repository_root=tmp_path, model="test", discovery_passes=["missing"])

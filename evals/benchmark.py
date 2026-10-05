@@ -251,6 +251,7 @@ def main() -> None:
                         help="Run only discovery and deduplication and score the unverified candidates: recall is candidate coverage, precision is not meaningful")
     parser.add_argument("--candidates-per-pass", type=int, help="Override the discovery per-pass candidate limit")
     parser.add_argument("--max-candidates", type=int, help="Override the candidate cap after deduplication")
+    parser.add_argument("--discovery-passes", nargs="+", help="Run only these discovery passes (by name)")
     args = parser.parse_args()
     review_settings = {}
     if args.discover_only:
@@ -259,6 +260,8 @@ def main() -> None:
         review_settings["candidates_per_pass"] = args.candidates_per_pass
     if args.max_candidates is not None:
         review_settings["max_candidates"] = args.max_candidates
+    if args.discovery_passes:
+        review_settings["discovery_passes"] = args.discovery_passes
     if review_settings and args.source_run:
         parser.error("Review settings cannot be combined with --source-run")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_name):

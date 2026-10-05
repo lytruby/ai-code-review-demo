@@ -374,6 +374,7 @@ class OpenAIReviewer(Reviewer):
         provider=None,
         candidates_per_pass=MAX_CANDIDATES_PER_DISCOVERY_PASS,
         max_candidates=MAX_CANDIDATES,
+        discovery_passes=None,
     ):
         if not 1 <= candidates_per_pass <= MAX_CANDIDATES_PER_DISCOVERY_PASS:
             raise ValueError("candidates_per_pass is out of range")
@@ -381,6 +382,16 @@ class OpenAIReviewer(Reviewer):
             raise ValueError("max_candidates is out of range")
         self.candidates_per_pass = candidates_per_pass
         self.max_candidates = max_candidates
+        known_passes = [name for name, _ in DISCOVERY_PASSES]
+        if discovery_passes is not None and (
+            not discovery_passes or set(discovery_passes) - set(known_passes)
+        ):
+            raise ValueError(f"discovery_passes must be a subset of {known_passes}")
+        self.discovery_passes = tuple(
+            (name, prompt)
+            for name, prompt in DISCOVERY_PASSES
+            if discovery_passes is None or name in discovery_passes
+        )
         configured_model = model or os.environ.get("LLM_MODEL")
         self.provider = self._resolve_provider(provider, configured_model)
         self.request_timeout = float(os.environ.get("LLM_TIMEOUT", "120"))
@@ -553,7 +564,7 @@ class OpenAIReviewer(Reviewer):
         pass_rejection_counts = []
         successful_passes = 0
 
-        for pass_name, focus_prompt in DISCOVERY_PASSES:
+        for pass_name, focus_prompt in self.discovery_passes:
             try:
                 candidates, rejection_count = self._discover_pass(
                     code_changes, state, pass_name, focus_prompt
@@ -611,7 +622,7 @@ class OpenAIReviewer(Reviewer):
                 "pass_candidate_counts": {
                     name: len(candidates)
                     for (name, _), candidates in zip(
-                        DISCOVERY_PASSES, pass_candidates, strict=True
+                        self.discovery_passes, pass_candidates, strict=True
                     )
                 },
             }
