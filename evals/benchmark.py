@@ -262,6 +262,8 @@ def main() -> None:
     parser.add_argument("--candidates-per-pass", type=int, help="Override the discovery per-pass candidate limit")
     parser.add_argument("--max-candidates", type=int, help="Override the candidate cap after deduplication")
     parser.add_argument("--discovery-passes", nargs="+", help="Run only these discovery passes (by name)")
+    parser.add_argument("--discovery-samples", type=int,
+                        help="Repeat every discovery pass this many times and merge the candidates")
     parser.add_argument("--jobs", type=int, default=1,
                         help="Review and score up to this many cases concurrently; cost is unchanged, provider rate limits apply")
     args = parser.parse_args()
@@ -274,6 +276,8 @@ def main() -> None:
         review_settings["max_candidates"] = args.max_candidates
     if args.discovery_passes:
         review_settings["discovery_passes"] = args.discovery_passes
+    if args.discovery_samples is not None:
+        review_settings["discovery_samples"] = args.discovery_samples
     if review_settings and args.source_run:
         parser.error("Review settings cannot be combined with --source-run")
     if args.jobs < 1:

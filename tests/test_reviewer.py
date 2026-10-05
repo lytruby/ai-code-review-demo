@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.models import CandidateIssue, EvidenceRef, RequiredFact
-from src.reviewer import MAX_CANDIDATES_PER_DISCOVERY_PASS, OpenAIReviewer, ReviewState
+from src.reviewer import MAX_CANDIDATES, MAX_CANDIDATES_PER_DISCOVERY_PASS, OpenAIReviewer, ReviewState
 
 
 class FakeCompletions:
@@ -1826,3 +1826,56 @@ def test_reviewer_runs_only_selected_discovery_passes(tmp_path):
     assert "Discovery pass: correctness" in completions.requests[0]["messages"][1]["content"]
     with pytest.raises(ValueError):
         OpenAIReviewer(client=client, repository_root=tmp_path, model="test", discovery_passes=["missing"])
+
+
+def test_discovery_samples_repeat_passes_and_merge_candidates(tmp_path):
+    def candidate(claim):
+        return (
+            f'{{"file":"example.py","severity":"medium","claim":"{claim}",'
+            '"evidence":[{"file":"example.py","side":"after","text":"return a / b"}],'
+            '"required_facts":[]}'
+        )
+
+    completions = FakeCompletions(
+        [
+            response(f'{{"candidates":[{candidate("Division by zero")}]}}'),
+            response(f'{{"candidates":[{candidate("Integer division truncates")}]}}'),
+            response(
+                '{"groups":['
+                '{"candidate_indices":[0],"representative_index":0,"priority":5,"reason":"a"},'
+                '{"candidate_indices":[1],"representative_index":1,"priority":4,"reason":"b"}]}'
+            ),
+        ],
+        auto_empty_state_pass=False,
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    reviewer = OpenAIReviewer(
+        client=client,
+        repository_root=tmp_path,
+        model="test",
+        discovery_passes=["correctness"],
+        discovery_samples=2,
+    )
+
+    result = reviewer.discover_only([{"filename": "example.py", "patch": "+    return a / b"}])
+
+    assert [issue.description for issue in result.issues] == [
+        "Division by zero",
+        "Integer division truncates",
+    ]
+    # Both samples send the same prompt so the second reuses the cached prefix.
+    assert completions.requests[0]["messages"] == completions.requests[1]["messages"]
+    assert reviewer.max_candidates == 2 * MAX_CANDIDATES
+    stage = next(e for e in reviewer.last_trace if e.get("type") == "stage_result" and e["stage"] == "discover")
+    assert stage["pass_candidate_counts"] == {"correctness": 1, "correctness#2": 1}
+
+
+def test_discovery_samples_are_bounded(tmp_path):
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions([])))
+    with pytest.raises(ValueError):
+        OpenAIReviewer(client=client, repository_root=tmp_path, model="test", discovery_samples=0)
+    with pytest.raises(ValueError):
+        OpenAIReviewer(
+            client=client, repository_root=tmp_path, model="test",
+            discovery_samples=2, max_candidates=2 * MAX_CANDIDATES + 1,
+        )

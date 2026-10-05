@@ -33,6 +33,7 @@ MAX_TOOL_CALLS = 80
 MAX_REQUIRED_FACTS_PER_CANDIDATE = 2
 MAX_CANDIDATES_PER_DISCOVERY_PASS = 5
 MAX_CANDIDATES = 16
+MAX_DISCOVERY_SAMPLES = 3
 MAX_DISCOVER_TURNS = 2
 MAX_DEDUPLICATE_TURNS = 2
 MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
@@ -40,17 +41,23 @@ MAX_CONTEXT_TURNS_PER_FACT = 3
 MAX_VERIFY_TURNS_PER_CANDIDATE = 4
 MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE = 1
 MAX_FINALIZE_TURNS = 2
-MAX_MODEL_TURNS = (
-    4 * MAX_DISCOVER_TURNS
-    + MAX_DEDUPLICATE_TURNS
-    + MAX_CANDIDATES * MAX_REQUIRED_FACTS_PER_CANDIDATE * MAX_CONTEXT_TURNS_PER_FACT
-    + MAX_CANDIDATES
-    * (
-        MAX_VERIFY_TURNS_PER_CANDIDATE
-        + MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE
+
+
+def model_turn_budget(discovery_requests: int, max_candidates: int) -> int:
+    return (
+        discovery_requests * MAX_DISCOVER_TURNS
+        + MAX_DEDUPLICATE_TURNS
+        + max_candidates * MAX_REQUIRED_FACTS_PER_CANDIDATE * MAX_CONTEXT_TURNS_PER_FACT
+        + max_candidates
+        * (
+            MAX_VERIFY_TURNS_PER_CANDIDATE
+            + MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE
+        )
+        + MAX_FINALIZE_TURNS
     )
-    + MAX_FINALIZE_TURNS
-)
+
+
+MAX_MODEL_TURNS = model_turn_budget(4, MAX_CANDIDATES)
 TRANSIENT_API_ERRORS = (
     APIConnectionError,
     APITimeoutError,
@@ -360,13 +367,20 @@ class OpenAIReviewer(Reviewer):
         model=None,
         provider=None,
         candidates_per_pass=MAX_CANDIDATES_PER_DISCOVERY_PASS,
-        max_candidates=MAX_CANDIDATES,
+        max_candidates=None,
         discovery_passes=None,
+        discovery_samples=1,
     ):
         if not 1 <= candidates_per_pass <= MAX_CANDIDATES_PER_DISCOVERY_PASS:
             raise ValueError("candidates_per_pass is out of range")
-        if not 1 <= max_candidates <= MAX_CANDIDATES:
+        if not 1 <= discovery_samples <= MAX_DISCOVERY_SAMPLES:
+            raise ValueError("discovery_samples is out of range")
+        # Each extra sample repeats every pass and may add as many candidates.
+        if max_candidates is None:
+            max_candidates = MAX_CANDIDATES * discovery_samples
+        if not 1 <= max_candidates <= MAX_CANDIDATES * discovery_samples:
             raise ValueError("max_candidates is out of range")
+        self.discovery_samples = discovery_samples
         self.candidates_per_pass = candidates_per_pass
         self.max_candidates = max_candidates
         known_passes = [name for name, _ in DISCOVERY_PASSES]
@@ -378,6 +392,9 @@ class OpenAIReviewer(Reviewer):
             (name, prompt)
             for name, prompt in DISCOVERY_PASSES
             if discovery_passes is None or name in discovery_passes
+        )
+        self.max_model_turns = model_turn_budget(
+            len(self.discovery_passes) * discovery_samples, max_candidates
         )
         configured_model = model or os.environ.get("LLM_MODEL")
         self.provider = self._resolve_provider(provider, configured_model)
@@ -551,7 +568,14 @@ class OpenAIReviewer(Reviewer):
         pass_rejection_counts = []
         successful_passes = 0
 
-        for pass_name, focus_prompt in self.discovery_passes:
+        # Repeated samples resend identical prompts: they reuse the cached
+        # prefix and, because sampling varies, find different candidates.
+        runs = [
+            (name if sample == 0 else f"{name}#{sample + 1}", name, prompt)
+            for sample in range(self.discovery_samples)
+            for name, prompt in self.discovery_passes
+        ]
+        for run_name, pass_name, focus_prompt in runs:
             try:
                 candidates, rejection_count = self._discover_pass(
                     code_changes, state, pass_name, focus_prompt
@@ -561,7 +585,7 @@ class OpenAIReviewer(Reviewer):
                     {
                         "type": "discovery_pass_failure",
                         "stage": "discover",
-                        "pass": pass_name,
+                        "pass": run_name,
                         "error": str(error),
                     }
                 )
@@ -607,9 +631,9 @@ class OpenAIReviewer(Reviewer):
                 ),
                 "rejected_candidate_count": sum(pass_rejection_counts),
                 "pass_candidate_counts": {
-                    name: len(candidates)
-                    for (name, _), candidates in zip(
-                        self.discovery_passes, pass_candidates, strict=True
+                    run_name: len(candidates)
+                    for (run_name, _, _), candidates in zip(
+                        runs, pass_candidates, strict=True
                     )
                 },
             }
@@ -1263,7 +1287,7 @@ class OpenAIReviewer(Reviewer):
         raise ValueError("FINALIZE did not finish within the workflow turn limit")
 
     def _request(self, messages: list[dict], state: ReviewState, allow_tools: bool):
-        if state.model_turns >= MAX_MODEL_TURNS:
+        if state.model_turns >= self.max_model_turns:
             raise ValueError("AI review reached the workflow turn limit")
 
         max_tokens = (
