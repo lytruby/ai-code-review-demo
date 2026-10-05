@@ -2425,3 +2425,32 @@ keycloak-37038），共 40 条 core golden，每组跑 2 次。val-pass5 用
 
 不能下的结论：每组只差 2–4 条命中，不能说安全 pass 有害；只测了 discover
 上限，仍不知道 pass5 在完整 review 中 verify 后的召回和误报。
+
+## 2026-10-05：discover 推理强度 high（val-high-r1/r2 作废，val-high16k-r1/r2 中途停止）
+
+代码 078a04f，discover-only，`--max-candidates 16`，`LLM_REASONING_EFFORT=high`，
+KIMI_THINKING 保持 disabled。验证组 15 个案例。
+
+第一次（val-high-r1/r2）用默认的 4096 输出上限、120 秒超时：high 的推理
+token 经常把上限用完（finish_reason=length、JSON 截断、丢 pass），还有 3 个
+案例连续超时失败。这组测的是截断后的 high，作废，不用于比较。
+
+第二次（val-high16k-r1/r2）把 `LLM_DISCOVER_MAX_COMPLETION_TOKENS` 和
+`LLM_MAX_COMPLETION_TOKENS` 调到 16384、`LLM_TIMEOUT` 调到 600：只有 1 轮截断，
+0 次超时，没有丢 pass。因为部分结果没有变好，按 Liu 的决定提前停止。
+r1 完成 6 个案例，r2 完成 5 个，只比较已完成的案例：
+
+| | high | low（val-pass5 r1 / r2） |
+|---|---:|---:|
+| r1 的 6 个案例，14 条 core golden | 9 | 9 / 10 |
+| r2 的 5 个案例，12 条 core golden | 7 | 8 / 9 |
+| 输出 token（同样案例） | 103.6k / 120.3k | 42.3k / 40.0k |
+| 平均候选数 | 9.4–9.6 | 7.5–8 |
+| r1 耗时 | 2881 秒 | 约 1100 秒 |
+
+high 没有命中任何一条 low 从未命中的 golden，输出 token 和耗时约为 low 的 3 倍。
+cal_dot_com-7232（r1）的 Judge 去重失败了一次（Invalid dedup partition），
+和 high 本身无关。
+
+决定：discover 保持 low。不能下的结论：只有 5–6 个案例，不能说 high 更差；
+也没测 KIMI_THINKING=enabled，以及在 verify 阶段用 high 的效果。
