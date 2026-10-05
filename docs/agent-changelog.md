@@ -2358,13 +2358,13 @@ discourse-benchmark-4/10/8、keycloak-36880/37634/33832。旧配置用
 |---|---:|---:|---:|---:|
 | Core TP / 75 | 39 | 37 | 44 | 48 |
 | Recall | 52.0% | 49.3% | 58.7% | 64.0% |
-| 平均候选数 | 6.7 | 7.1 | 9.9 | 9.5 |
+| 平均候选数 | 6.5 | 7.0 | 9.9 | 9.9 |
 | prompt（未命中 + 命中） | 76.7 万 | 76.4 万 | 78.4 万 | 78.3 万 |
 | 输出 | 8.3 万 | 8.8 万 | 11.2 万 | 10.7 万 |
 
 pass5 的两次都高于 pass3 的两次，合计 92/150 vs 76/150（+10.7 个百分点），
-与 dev 集上的方向一致。discover 本身的 prompt 几乎不变、输出 +27%；主要成本
-在完整 review 中 verify 的候选多了约 45%。
+与 dev 集上的方向一致。discover 本身的 prompt 几乎不变、输出 +28%；主要成本
+在完整 review 中 verify 的候选多了约 47%。
 
 4 次都漏的 golden 按文本粗分：约 3/4 问题在 diff 中可见（如 discourse-benchmark-4
 的 SSRF、ALLOWALL、referer XSS、ERB `end if`，cal_dot_com-11059 的 statusText），
