@@ -2428,8 +2428,9 @@ keycloak-37038），共 40 条 core golden，每组跑 2 次。val-pass5 用
 
 ## 2026-10-05：discover 推理强度 high（val-high-r1/r2 作废，val-high16k-r1/r2 中途停止）
 
-代码 078a04f，discover-only，`--max-candidates 16`，`LLM_REASONING_EFFORT=high`，
-KIMI_THINKING 保持 disabled。验证组 15 个案例。
+代码 078a04f，discover-only，`--max-candidates 16`，`LLM_REASONING_EFFORT=high`。
+K3 始终开启推理，`KIMI_THINKING` 只对 K2 生效，所以这里比较的是推理强度 high 与
+low。验证组 15 个案例。
 
 第一次（val-high-r1/r2）用默认的 4096 输出上限、120 秒超时：high 的推理
 token 经常把上限用完（finish_reason=length、JSON 截断、丢 pass），还有 3 个
@@ -2453,4 +2454,31 @@ cal_dot_com-7232（r1）的 Judge 去重失败了一次（Invalid dedup partitio
 和 high 本身无关。
 
 决定：discover 保持 low。不能下的结论：只有 5–6 个案例，不能说 high 更差；
-也没测 KIMI_THINKING=enabled，以及在 verify 阶段用 high 的效果。
+也没测在 verify 阶段用 high 的效果。
+
+## 2026-10-05：discover 采样 2 次再合并（val-samp2-r1 / r2）
+
+代码 5874473：新增 `discovery_samples`（CLI 为 `--discovery-samples`）。每个 pass
+用完全相同的提示词重复请求，第二次能复用缓存前缀；候选合并后统一语义去重，
+上限随采样次数放大（采样 2 次时上限为 32）。默认采样 1 次，行为不变。
+本次 discover-only，采样 2 次，low，`--jobs 4`，验证组 15 个案例各跑 2 次。
+中途 Kimi 余额用完一次，充值后用原运行名续跑完成。
+
+| | samp2 r1 | samp2 r2 | pass5 r1 | pass5 r2 |
+|---|---:|---:|---:|---:|
+| Core TP / 40 | 28 | 28 | 23 | 25 |
+| 两次并集 | 31 | | 27 | |
+| 去重后候选（每案例） | 11.9 | 13.2 | 7.5 | 8.0 |
+| prompt 未命中 / 命中 | 14.5 万 / 82.2 万 | 15.5 万 / 83.4 万 | 9.0 万 / 37.4 万 | 11.1 万 / 36.6 万 |
+| 输出 | 19.9 万 | 20.4 万 | 9.7 万 | 10.3 万 |
+
+单次平均 24 → 28（+10 个百分点），两次都高于 pass5 的两次，是这轮实验里唯一
+在没看过的案例上复现的提升。之前 6 次运行都没命中的 11 条里新命中 4 条
+（discourse-1 tempfile.size 循环、sentry-3 `0.0` 被当作假值、discourse-3 域名
+正则、discourse-5 float/flex 混用）。去重合并掉约 40% 的候选。keycloak-37429 的
+discover 首轮多次超过 120 秒，整个案例失败 3 次，用原参数续跑后完成；
+没有 429。
+
+不能下的结论：只测了 discover 上限。完整 review 中 verify 要多处理约 60% 的
+候选，而 `MAX_TOOL_CALLS`（80）没有随采样次数放大，每个候选能分到的工具调用
+会变少。verify 之后的召回和误报都还不知道。
