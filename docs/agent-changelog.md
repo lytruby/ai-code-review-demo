@@ -2397,3 +2397,31 @@ ALLOWALL、referer XSS、origin 校验等中的一部分）。discover 成本 pr
 
 不能下的结论：安全 pass 是看着这 15 个案例的漏报设计的，提升可能部分来自
 对这批案例的拟合，需要换一批未看过的案例复核；仍只测了 discover 上限。
+
+## 2026-10-05：安全 pass 在未看过的案例上复核（val-pass5 / val-sec），已回退
+
+代码 9f384ac，discover-only，`--max-candidates 16`。换了 15 个没看过漏报的
+非 held-out 案例（sentry-benchmark-3、sentry-80168、sentry-77754、
+grafana-106778、grafana-80329、grafana-90939、cal_dot_com-22532、
+cal_dot_com-7232、cal_dot_com-8330、discourse-benchmark-1、
+discourse-benchmark-3、discourse-benchmark-5、keycloak-37429、keycloak-36882、
+keycloak-37038），共 40 条 core golden，每组跑 2 次。val-pass5 用
+`--discovery-passes` 只跑原来 4 个 pass。
+
+| | pass5 r1 | pass5 r2 | sec r1 | sec r2 |
+|---|---:|---:|---:|---:|
+| Core TP / 40 | 23 | 25 | 21 | 21 |
+| Recall | 57.5% | 62.5% | 52.5% | 52.5% |
+| prompt（未命中 + 命中） | 约 46–48 万 | | 约 61–64 万 | |
+| 输出 | 约 10 万 | | 约 11 万 | |
+
+合计 42/80（52.5%）vs 48/80（60.0%）：安全 pass 在新案例上没有提升，两次都
+不高于 pass5，prompt 约 +33%。上一轮的 +5.4 个百分点没有复现，更可能是对设计
+时看过的那 15 个案例的拟合。这批案例里安全类 golden 很少，也可能是没起作用的
+原因之一。
+
+决定：回退 35cd1d4，默认回到 4 个 pass（每 pass 5 条、`MAX_CANDIDATES` 16、
+`MAX_TOOL_CALLS` 80）；保留 `--discovery-passes` 选项。
+
+不能下的结论：每组只差 2–4 条命中，不能说安全 pass 有害；只测了 discover
+上限，仍不知道 pass5 在完整 review 中 verify 后的召回和误报。

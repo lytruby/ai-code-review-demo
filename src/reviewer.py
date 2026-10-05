@@ -29,10 +29,10 @@ from src.models import (
 from src.tools import READ_FILE_TOOL, SEARCH_CODE_TOOL
 from src.tool_gateway import ToolGateway, ToolProposal
 
-MAX_TOOL_CALLS = 100
+MAX_TOOL_CALLS = 80
 MAX_REQUIRED_FACTS_PER_CANDIDATE = 2
 MAX_CANDIDATES_PER_DISCOVERY_PASS = 5
-MAX_CANDIDATES = 20
+MAX_CANDIDATES = 16
 MAX_DISCOVER_TURNS = 2
 MAX_DEDUPLICATE_TURNS = 2
 MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
@@ -41,7 +41,7 @@ MAX_VERIFY_TURNS_PER_CANDIDATE = 4
 MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE = 1
 MAX_FINALIZE_TURNS = 2
 MAX_MODEL_TURNS = (
-    5 * MAX_DISCOVER_TURNS
+    4 * MAX_DISCOVER_TURNS
     + MAX_DEDUPLICATE_TURNS
     + MAX_CANDIDATES * MAX_REQUIRED_FACTS_PER_CANDIDATE * MAX_CONTEXT_TURNS_PER_FACT
     + MAX_CANDIDATES
@@ -180,19 +180,6 @@ that cannot detect the regression, and setup/cleanup that leaks state between
 tests. Explain how the test can pass incorrectly or fail nondeterministically.
 Do not request broader test coverage or return production-code design/style
 concerns in this pass.
-""",
-    ),
-    (
-        "security",
-        """\
-Focus only on security defects introduced by the changes: untrusted input
-reaching SQL, shell, file paths, URLs fetched by the server (SSRF), HTML or
-JavaScript output without escaping (XSS), weakened authentication,
-authorization, CSRF, CORS or framing protections, origin or referer checks that
-can be bypassed, and secrets or sensitive data exposed in responses or logs.
-Name the attacker-controlled input and the concrete exploit path. Do not return
-generic hardening advice, correctness, concurrency, or test-quality concerns in
-this pass.
 """,
     ),
 )
