@@ -2344,3 +2344,33 @@ updateDevice 又各漏了，总体与 pass5 持平。github_authenticated_user �
 
 结论：没有可测出的收益，而且这个 pass 是看着 dev 集漏报设计的，有过拟合
 风险，因此撤回，保留 pass5 配置。
+
+## 2026-10-05：15 个新案例上的 discover-only 对比（disc-pass3 / disc-pass5）
+
+代码 2394485，`--discover-only`：只跑 discover + 去重，把未验证候选交给 Judge，
+Recall 表示候选对 golden 的覆盖率。案例为每个项目按 golden 数量取前 3 个的
+非 dev、非 held-out 案例，共 15 个、75 条 core golden：sentry-benchmark-5/1/2、
+grafana-103633/76186/90045、cal_dot_com-11059/14740/10967、
+discourse-benchmark-4/10/8、keycloak-36880/37634/33832。旧配置用
+`--candidates-per-pass 3 --max-candidates 8` 模拟。各跑 2 次。
+
+| | pass3 r1 | pass3 r2 | pass5 r1 | pass5 r2 |
+|---|---:|---:|---:|---:|
+| Core TP / 75 | 39 | 37 | 44 | 48 |
+| Recall | 52.0% | 49.3% | 58.7% | 64.0% |
+| 平均候选数 | 6.7 | 7.1 | 9.9 | 9.5 |
+| prompt（未命中 + 命中） | 76.7 万 | 76.4 万 | 78.4 万 | 78.3 万 |
+| 输出 | 8.3 万 | 8.8 万 | 11.2 万 | 10.7 万 |
+
+pass5 的两次都高于 pass3 的两次，合计 92/150 vs 76/150（+10.7 个百分点），
+与 dev 集上的方向一致。discover 本身的 prompt 几乎不变、输出 +27%；主要成本
+在完整 review 中 verify 的候选多了约 45%。
+
+4 次都漏的 golden 按文本粗分：约 3/4 问题在 diff 中可见（如 discourse-benchmark-4
+的 SSRF、ALLOWALL、referer XSS、ERB `end if`，cal_dot_com-11059 的 statusText），
+约 1/4 需要仓库上下文（如引用不存在的 OptimizedCursorPaginator、keycloak
+资源查找方式、路由参数名）。漏掉的 diff 可见问题里安全类集中：现有 4 个 pass
+没有专门的安全 pass。
+
+不能下的结论：只测了 discover 上限，verify 是否保留这些候选、FP 变化未知；
+sentry-benchmark-5 在 pass3-r1 首次 Judge 去重失败，续跑后完成。
