@@ -69,6 +69,7 @@ uv run python -m evals.benchmark run --provider kimi --run-name disc-pass3-r1 \
 Precision / F1 没有意义。每个案例约 5–6 次模型调用，完整 review 约 25–40 次。
 确认 discover 有提升后，仍需要用完整 review 小规模复核 verify 和 FP。
 `--candidates-per-pass` 和 `--max-candidates` 只能调低，不能超过代码中的上限。
+默认每个 pass 采样 2 次再合并；`--discovery-samples 1` 可以恢复为只采样 1 次。
 
 ## 并行跑案例
 

@@ -4,7 +4,16 @@ from types import SimpleNamespace
 import pytest
 
 from src.models import CandidateIssue, EvidenceRef, RequiredFact
+import src.reviewer
 from src.reviewer import MAX_CANDIDATES, MAX_CANDIDATES_PER_DISCOVERY_PASS, OpenAIReviewer, ReviewState
+
+
+@pytest.fixture(autouse=True)
+def single_discovery_sample(monkeypatch, request):
+    # Most tests script one response per discovery pass; repeated sampling is
+    # covered by its own tests.
+    if "real_sample_default" not in request.keywords:
+        monkeypatch.setattr(src.reviewer, "DISCOVERY_SAMPLES", 1)
 
 
 class FakeCompletions:
@@ -1757,12 +1766,10 @@ def test_tool_turn_output_accepts_prose_before_fenced_json():
 
 
 def test_verify_finalizes_immediately_when_tool_budget_is_spent(tmp_path):
-    from src.reviewer import MAX_TOOL_CALLS
-
     reviewer, completions = verification_reviewer(tmp_path, [
         response(verification_decision(verdict="inconclusive")),
     ])
-    state = ReviewState(stage="verify", tool_calls=MAX_TOOL_CALLS)
+    state = ReviewState(stage="verify", tool_calls=reviewer.max_tool_calls)
     issues, decision = reviewer._verify_candidate(
         "File: example.py\nPatch:\n+changed()", verification_candidate(), 0, state, [], 0,
     )
@@ -1879,3 +1886,13 @@ def test_discovery_samples_are_bounded(tmp_path):
             client=client, repository_root=tmp_path, model="test",
             discovery_samples=2, max_candidates=2 * MAX_CANDIDATES + 1,
         )
+
+
+@pytest.mark.real_sample_default
+def test_default_review_samples_discovery_twice_with_scaled_budgets(tmp_path):
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions([])))
+    reviewer = OpenAIReviewer(client=client, repository_root=tmp_path, model="test")
+
+    assert reviewer.discovery_samples == 2
+    assert reviewer.max_candidates == 2 * MAX_CANDIDATES
+    assert reviewer.max_tool_calls == 5 * reviewer.max_candidates

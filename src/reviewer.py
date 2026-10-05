@@ -29,11 +29,13 @@ from src.models import (
 from src.tools import READ_FILE_TOOL, SEARCH_CODE_TOOL
 from src.tool_gateway import ToolGateway, ToolProposal
 
-MAX_TOOL_CALLS = 80
+MAX_TOOL_CALLS_PER_CANDIDATE = 5
 MAX_REQUIRED_FACTS_PER_CANDIDATE = 2
 MAX_CANDIDATES_PER_DISCOVERY_PASS = 5
 MAX_CANDIDATES = 16
 MAX_DISCOVERY_SAMPLES = 3
+# Two samples raised discover-only core recall on unseen cases from 24 to 28 of 40.
+DISCOVERY_SAMPLES = 2
 MAX_DISCOVER_TURNS = 2
 MAX_DEDUPLICATE_TURNS = 2
 MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
@@ -57,7 +59,8 @@ def model_turn_budget(discovery_requests: int, max_candidates: int) -> int:
     )
 
 
-MAX_MODEL_TURNS = model_turn_budget(4, MAX_CANDIDATES)
+MAX_TOOL_CALLS = MAX_TOOL_CALLS_PER_CANDIDATE * MAX_CANDIDATES * DISCOVERY_SAMPLES
+MAX_MODEL_TURNS = model_turn_budget(4 * DISCOVERY_SAMPLES, MAX_CANDIDATES * DISCOVERY_SAMPLES)
 TRANSIENT_API_ERRORS = (
     APIConnectionError,
     APITimeoutError,
@@ -369,10 +372,12 @@ class OpenAIReviewer(Reviewer):
         candidates_per_pass=MAX_CANDIDATES_PER_DISCOVERY_PASS,
         max_candidates=None,
         discovery_passes=None,
-        discovery_samples=1,
+        discovery_samples=None,
     ):
         if not 1 <= candidates_per_pass <= MAX_CANDIDATES_PER_DISCOVERY_PASS:
             raise ValueError("candidates_per_pass is out of range")
+        if discovery_samples is None:
+            discovery_samples = DISCOVERY_SAMPLES
         if not 1 <= discovery_samples <= MAX_DISCOVERY_SAMPLES:
             raise ValueError("discovery_samples is out of range")
         # Each extra sample repeats every pass and may add as many candidates.
@@ -393,6 +398,7 @@ class OpenAIReviewer(Reviewer):
             for name, prompt in DISCOVERY_PASSES
             if discovery_passes is None or name in discovery_passes
         )
+        self.max_tool_calls = MAX_TOOL_CALLS_PER_CANDIDATE * max_candidates
         self.max_model_turns = model_turn_budget(
             len(self.discovery_passes) * discovery_samples, max_candidates
         )
@@ -920,7 +926,7 @@ class OpenAIReviewer(Reviewer):
             # or invalid decisions, so ask for the final decision right away.
             is_finalization_turn = (
                 turn_index >= MAX_VERIFY_TURNS_PER_CANDIDATE
-                or state.tool_calls >= MAX_TOOL_CALLS
+                or state.tool_calls >= self.max_tool_calls
             )
             if is_finalization_turn and not finalization_requested:
                 finalization_requested = True
@@ -962,7 +968,7 @@ class OpenAIReviewer(Reviewer):
                 last_validation_error = "Textual tool arguments are not executable proposals"
                 retry_allowed = (
                     turn_index + 1 < MAX_VERIFY_TURNS_PER_CANDIDATE
-                    and text_tool_corrections == 0 and state.tool_calls < MAX_TOOL_CALLS
+                    and text_tool_corrections == 0 and state.tool_calls < self.max_tool_calls
                 )
                 self._record_tool_protocol_error(state, candidate_index, None, retry_allowed)
                 if not retry_allowed:
@@ -1077,7 +1083,7 @@ class OpenAIReviewer(Reviewer):
                 successful_tool_calls += int(search_succeeded)
 
                 matches = fact_context["search"].get("matches", [])
-                if search_succeeded and matches and state.tool_calls < MAX_TOOL_CALLS:
+                if search_succeeded and matches and state.tool_calls < self.max_tool_calls:
                     first_match = matches[0]
                     read_output, read_succeeded = self._execute_workflow_tool(
                         tool_name="read_file",
@@ -1143,7 +1149,7 @@ class OpenAIReviewer(Reviewer):
         protocol_retry_used = False
         for turn_index in range(MAX_CONTEXT_TURNS_PER_FACT):
             remaining = MAX_CONTEXT_TOOL_CALLS_PER_FACT - fact_context["tool_calls"]
-            if remaining <= 0 or state.tool_calls >= MAX_TOOL_CALLS:
+            if remaining <= 0 or state.tool_calls >= self.max_tool_calls:
                 break
             message = self._request(messages, state, allow_tools=True)
             tool_calls = message.tool_calls or []
@@ -1242,7 +1248,7 @@ class OpenAIReviewer(Reviewer):
     ) -> str:
         if state.tool_gateway is None:
             state.tool_gateway = ToolGateway(
-                self.repository_root, max_calls=max(0, MAX_TOOL_CALLS - state.tool_calls),
+                self.repository_root, max_calls=max(0, self.max_tool_calls - state.tool_calls),
             )
         outcome = state.tool_gateway.execute(
             proposal, source=source, stage=state.stage, tools_allowed=tools_allowed,
@@ -1328,7 +1334,7 @@ class OpenAIReviewer(Reviewer):
             }
             if session is not None:
                 request["previous_response_id"] = session["previous_response_id"]
-            if allow_tools and state.tool_calls < MAX_TOOL_CALLS:
+            if allow_tools and state.tool_calls < self.max_tool_calls:
                 request["tools"] = [READ_FILE_TOOL, SEARCH_CODE_TOOL]
         else:
             request = {
@@ -1340,7 +1346,7 @@ class OpenAIReviewer(Reviewer):
                 request["reasoning_effort"] = self.reasoning_effort
             elif self.model.startswith("kimi-k2"):
                 request["extra_body"] = {"thinking": {"type": self.kimi_thinking}}
-            if allow_tools and state.tool_calls < MAX_TOOL_CALLS:
+            if allow_tools and state.tool_calls < self.max_tool_calls:
                 request["tools"] = [
                     self._chat_tool(READ_FILE_TOOL),
                     self._chat_tool(SEARCH_CODE_TOOL),
