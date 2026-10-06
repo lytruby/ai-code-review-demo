@@ -2136,3 +2136,33 @@ def test_report_rule_filters_kept_issues_and_records_scores(tmp_path):
     assert len(reviewer._verify("File: example.py\nPatch:\n+changed()", ReviewState(candidates=[verification_candidate()]))) == 1
     with pytest.raises(ValueError):
         OpenAIReviewer(client=reviewer.client, repository_root=tmp_path, model="test", report_rule={"speed": 3})
+
+
+def test_refute_policy_changes_only_the_rejection_rule():
+    strict = OpenAIReviewer(client=object(), model="test")._verify_prompt()
+    refute = OpenAIReviewer(client=object(), model="test", verify_policy="refute")._verify_prompt()
+    assert "speculative, non-actionable, or only a\n  future maintenance concern." in strict
+    assert "Lack of\n  proof is not a reason to reject" in refute
+    assert "{rejected_rule}" not in strict + refute
+    with pytest.raises(ValueError, match="verify_policy"):
+        OpenAIReviewer(client=object(), model="test", verify_policy="loose")
+
+
+def test_refute_policy_reports_inconclusive_candidates_unverified():
+    candidate = CandidateIssue(
+        file="example.py",
+        severity="medium",
+        claim="Possible bug",
+        evidence=[EvidenceRef(side="after", text="value = 1")],
+    )
+    state = SimpleNamespace(patches={"example.py": "@@ -0,0 +1 @@\n+value = 1"})
+    strict = OpenAIReviewer(client=object(), model="test")
+    refute = OpenAIReviewer(client=object(), model="test", verify_policy="refute")
+
+    assert strict._report_unverified({"verdict": "inconclusive"}, candidate, state) == []
+    assert refute._report_unverified({"verdict": "rejected"}, candidate, state) == []
+    decision = {"verdict": "inconclusive"}
+    issues = refute._report_unverified(decision, candidate, state)
+
+    assert decision["reported_unverified"] is True
+    assert [(i.file, i.description, i.start_line) for i in issues] == [("example.py", "Possible bug", 1)]

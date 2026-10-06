@@ -144,6 +144,8 @@ def review(args, settings: dict) -> None:
     prs = load_prs(args.split)
     if args.pr:
         prs = [pr for pr in prs if pr_key(pr) in args.pr]
+    if args.max_lines:
+        prs = [pr for pr in prs if pr["lines_added"] + pr["lines_removed"] < args.max_lines]
     if args.limit:
         prs = prs[:args.limit]
     run_dir = RUNS_DIR / args.run_name
@@ -208,9 +210,12 @@ def main() -> None:
     parser.add_argument("--pr", nargs="+", help="Only these PR keys, e.g. owner_repo_12-abcdef01")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--max-lines", type=int, help="Only PRs with fewer added+removed lines than this")
     parser.add_argument("--report-rule", help="e.g. certainty=4")
+    parser.add_argument("--verify-policy", choices=("strict", "refute"))
     parser.add_argument("--judge-provider", default="openai")
-    parser.add_argument("--judge-model", default=os.environ.get("JUDGE_MODEL", "gpt-6.1-sol"))
+    # The judge's model registry has no gpt-6.1-sol; gpt-5.5 is its newest OpenAI model.
+    parser.add_argument("--judge-model", default="gpt-5.5")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_name):
         parser.error("Invalid run name")
@@ -218,6 +223,8 @@ def main() -> None:
     if args.report_rule:
         settings["report_rule"] = {name.strip(): int(value) for name, value in
                                    (item.split("=") for item in args.report_rule.split(","))}
+    if args.verify_policy:
+        settings["verify_policy"] = args.verify_policy
     if args.command == "review":
         review(args, settings)
     else:

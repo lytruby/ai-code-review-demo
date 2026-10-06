@@ -272,6 +272,8 @@ def main() -> None:
                         help="Let each discovery pass call read_file and search_code a few times")
     parser.add_argument("--report-rule",
                         help="Report only verified issues whose scores reach these minimums, e.g. certainty=4,worth_reporting=3")
+    parser.add_argument("--verify-policy", choices=("strict", "refute"),
+                        help="refute: reject only on counter-evidence and report inconclusive candidates unverified")
     parser.add_argument("--jobs", type=int, default=1,
                         help="Review and score up to this many cases concurrently; cost is unchanged, provider rate limits apply")
     args = parser.parse_args()
@@ -300,6 +302,8 @@ def main() -> None:
         review_settings["discovery_tools"] = True
     if args.discovery_context is not None:
         review_settings["discovery_context"] = args.discovery_context
+    if args.verify_policy is not None:
+        review_settings["verify_policy"] = args.verify_policy
     if review_settings and args.source_run:
         parser.error("Review settings cannot be combined with --source-run")
     if args.jobs < 1:

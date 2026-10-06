@@ -292,8 +292,7 @@ Invoke tools through actual function tool calls. Never return tool arguments
 such as {"query": ...} or {"path": ...} as ordinary JSON content.
 - keep: the candidate is supported as written;
 - revise: there is a real issue, but its description or suggestion needs repair;
-- rejected: the candidate is contradicted, speculative, non-actionable, or only a
-  future maintenance concern.
+{rejected_rule}
 - inconclusive: available evidence is insufficient to decide within the budget.
 
 Judge the candidate's smallest concrete defect separately from any overstated
@@ -367,6 +366,17 @@ cannot support a keep or revise decision, return inconclusive with issue=null;
 do not switch basis to bypass a required repository fact.
 """
 
+VERIFY_REJECT_STRICT = """\
+- rejected: the candidate is contradicted, speculative, non-actionable, or only a
+  future maintenance concern."""
+# Recall-oriented: a candidate stands unless the evidence refutes it.
+VERIFY_REJECT_REFUTE = """\
+- rejected: only when evidence you have read contradicts the core defect, for
+  example the guarded case cannot occur or the code already handles it. Lack of
+  proof is not a reason to reject; maintainability, test and documentation
+  problems that a reviewer would raise are actionable."""
+VERIFY_POLICIES = ("strict", "refute")
+
 ACQUIRE_CONTEXT_PROMPT = """\
 Stage: ACQUIRE_CONTEXT
 
@@ -438,7 +448,12 @@ class OpenAIReviewer(Reviewer):
         discovery_context="none",
         discovery_tools=False,
         report_rule=None,
+        verify_policy="strict",
     ):
+        if verify_policy not in VERIFY_POLICIES:
+            raise ValueError(f"verify_policy must be one of {VERIFY_POLICIES}")
+        # refute: reject only on counter-evidence and report inconclusive candidates unverified.
+        self.verify_policy = verify_policy
         if discovery_mode not in DISCOVERY_MODES:
             raise ValueError(f"discovery_mode must be one of {DISCOVERY_MODES}")
         if discovery_context not in DISCOVERY_CONTEXTS:
@@ -1077,6 +1092,7 @@ class OpenAIReviewer(Reviewer):
                         "successful_tool_calls": acquired_tool_calls,
                     }
                 )
+                verified.extend(self._report_unverified(decision, candidate, state))
                 decisions.append(decision)
                 continue
 
@@ -1094,6 +1110,7 @@ class OpenAIReviewer(Reviewer):
                 candidate_issues = []
             for issue in candidate_issues:
                 self._locate(issue, candidate_decision.get("supporting_evidence") or [], candidate, state)
+            candidate_issues = candidate_issues or self._report_unverified(candidate_decision, candidate, state)
             verified.extend(candidate_issues)
             decisions.append(candidate_decision)
 
@@ -1133,6 +1150,19 @@ class OpenAIReviewer(Reviewer):
         if found is not None:
             issue.start_line, issue.end_line = found
 
+    def _verify_prompt(self) -> str:
+        rule = VERIFY_REJECT_REFUTE if self.verify_policy == "refute" else VERIFY_REJECT_STRICT
+        return VERIFY_PROMPT.replace("{rejected_rule}", rule)
+
+    def _report_unverified(self, decision: dict, candidate: CandidateIssue, state: ReviewState) -> list[ReviewIssue]:
+        """Under the refute policy, report an inconclusive candidate as written."""
+        if self.verify_policy != "refute" or decision.get("verdict") != "inconclusive":
+            return []
+        decision["reported_unverified"] = True
+        issue = ReviewIssue(file=candidate.file, severity=candidate.severity, description=candidate.claim, suggestion="")
+        self._locate(issue, [], candidate, state)
+        return [issue]
+
     def _passes_report_rule(self, decision: dict) -> bool:
         scores = decision.get("scores") or {}
         return all(scores.get(name, 0) >= minimum for name, minimum in self.report_rule.items())
@@ -1149,7 +1179,7 @@ class OpenAIReviewer(Reviewer):
         successful_tool_calls = initial_successful_tool_calls
         expected_basis = "repository" if candidate.required_facts else "diff"
         messages = [
-            {"role": "system", "content": f"{REVIEW_PROMPT}\n\n{VERIFY_PROMPT}"},
+            {"role": "system", "content": f"{REVIEW_PROMPT}\n\n{self._verify_prompt()}"},
             {
                 "role": "user",
                 # Candidate-specific text follows the shared changes so every
