@@ -43,7 +43,7 @@ DISCOVERY_WORKERS = 4
 # Unit discovery splits the diff into at most this many units, one request
 # each, so a case costs about as many discovery requests as the passes mode.
 MAX_DISCOVERY_UNITS = 8
-UNIT_CONTEXT_LINES = 30
+UNIT_CONTEXT_LINES = 15
 DISCOVERY_MODES = ("passes", "units")
 MAX_DISCOVER_TURNS = 2
 MAX_DEDUPLICATE_TURNS = 2
@@ -205,8 +205,9 @@ concerns in this pass.
 )
 
 UNIT_DISCOVERY_PROMPT = """\
-Review only the unit below, which is one part of the changes above. Check every
-changed line in this unit against each item of this checklist:
+Each discovery pass reviews only the unit given after this checklist, which is
+one part of the changes above. Check every changed line in that unit against
+each item of this checklist:
 - runtime correctness: types and signatures, null/undefined and falsy values
   such as 0 or empty strings, boundary and off-by-one conditions, control flow
   that cannot work as written, invalid API usage;
@@ -221,7 +222,7 @@ changed line in this unit against each item of this checklist:
   and weakened checks;
 - tests: wrong expected values, assertions that cannot fail, mocks that bypass
   the behavior under test, timing races.
-The surrounding code is shown only for context. Evidence must quote the
+The code around the unit is shown only for context. Evidence must quote the
 changes above, not the surrounding code.
 """
 
@@ -662,8 +663,18 @@ class OpenAIReviewer(Reviewer):
         last = min(len(lines), start + length + UNIT_CONTEXT_LINES)
         if first > last:
             return text
-        context = "\n".join(f"{number}: {lines[number - 1]}" for number in range(first, last + 1))
-        return f"{text}\nSurrounding code after the change (lines {first}-{last}):\n{context}"
+        # The changed lines are already in the hunk; show only the code around it.
+        sections = [text]
+        for label, lines_range in (
+            ("before", range(first, start)),
+            ("after", range(start + length, last + 1)),
+        ):
+            if lines_range:
+                context = "\n".join(f"{number}: {lines[number - 1]}" for number in lines_range)
+                sections.append(
+                    f"Code {label} the hunk (lines {lines_range.start}-{lines_range.stop - 1}):\n{context}"
+                )
+        return "\n".join(sections)
 
     def _discover(self, code_changes: str, state: ReviewState, changes=None) -> list[CandidateIssue]:
         pass_candidates = []
@@ -682,7 +693,7 @@ class OpenAIReviewer(Reviewer):
             # repeating category passes over the whole diff.
             units = self._discovery_units(changes or [])
             runs = [
-                (f"unit-{index + 1}", f"unit-{index + 1}", f"{UNIT_DISCOVERY_PROMPT}\n{unit}")
+                (f"unit-{index + 1}", f"unit-{index + 1}", f"Review only this unit:\n{unit}")
                 for index, unit in enumerate(units)
             ] or runs
 
@@ -884,7 +895,10 @@ class OpenAIReviewer(Reviewer):
                 # pass reuses the same cached prompt prefix.
                 "content": (
                     f"Untrusted changes:\n\n{code_changes}\n\n"
-                    f"Discovery pass: {pass_name}\n\n{focus_prompt}\n\n"
+                    # The unit checklist is the same for every unit, so it
+                    # stays in the cached prefix.
+                    + (f"{UNIT_DISCOVERY_PROMPT}\n" if self.discovery_mode == "units" else "")
+                    + f"Discovery pass: {pass_name}\n\n{focus_prompt}\n\n"
                     f"Run the {pass_name} discovery pass on the changes above."
                 ),
             },
