@@ -272,12 +272,6 @@ impact is unconfirmed. If the evidence you read disproves the candidate's
 mechanism but shows a different concrete defect in the same changed code path,
 revise the candidate to that defect instead of rejecting it.
 
-Do not reject a candidate on library, framework, or runtime behavior that you
-recall but have not established from the diff or a successfully read source.
-Read the relevant source when it is in the repository. If you cannot, and the
-defect holds unless that behavior applies, keep or revise the candidate and
-state the assumption in the description.
-
 A changed test that asserts a wrong expected value, cannot fail for the
 regression it targets, or contradicts the implementation it tests is a concrete
 defect; do not reject it as a test-quality or coverage concern.
