@@ -27,6 +27,7 @@ from src.models import (
     ReviewResult,
     review_issue_from_dict,
 )
+from src.change_context import build_change_context
 from src.tools import READ_FILE_TOOL, SEARCH_CODE_TOOL
 from src.tool_gateway import ToolGateway, ToolProposal
 
@@ -45,6 +46,7 @@ DISCOVERY_WORKERS = 4
 MAX_DISCOVERY_UNITS = 8
 UNIT_CONTEXT_LINES = 30
 DISCOVERY_MODES = ("passes", "units")
+DISCOVERY_CONTEXTS = ("none", "callers")
 MAX_DISCOVER_TURNS = 2
 MAX_DEDUPLICATE_TURNS = 2
 MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
@@ -419,10 +421,14 @@ class OpenAIReviewer(Reviewer):
         discovery_passes=None,
         discovery_samples=None,
         discovery_mode="passes",
+        discovery_context="none",
     ):
         if discovery_mode not in DISCOVERY_MODES:
             raise ValueError(f"discovery_mode must be one of {DISCOVERY_MODES}")
+        if discovery_context not in DISCOVERY_CONTEXTS:
+            raise ValueError(f"discovery_context must be one of {DISCOVERY_CONTEXTS}")
         self.discovery_mode = discovery_mode
+        self.discovery_context = discovery_context
         if not 1 <= candidates_per_pass <= MAX_CANDIDATES_PER_DISCOVERY_PASS:
             raise ValueError("candidates_per_pass is out of range")
         if discovery_samples is None:
@@ -686,10 +692,23 @@ class OpenAIReviewer(Reviewer):
                 for index, unit in enumerate(units)
             ] or runs
 
+        shared_context = ""
+        if self.discovery_context == "callers":
+            shared_context = build_change_context(changes or [], self.repository_root)
+            state.trace.append(
+                {
+                    "type": "discovery_context",
+                    "stage": "discover",
+                    "characters": len(shared_context),
+                }
+            )
+
         def run_pass(run):
             run_name, pass_name, focus_prompt = run
             try:
-                return self._discover_pass(code_changes, state, pass_name, focus_prompt)
+                return self._discover_pass(
+                    code_changes, state, pass_name, focus_prompt, shared_context
+                )
             except ValueError as error:
                 state.trace.append(
                     {
@@ -870,6 +889,7 @@ class OpenAIReviewer(Reviewer):
         state: ReviewState,
         pass_name: str,
         focus_prompt: str,
+        shared_context: str = "",
     ) -> tuple[list[CandidateIssue], int]:
         messages = [
             {
@@ -884,7 +904,18 @@ class OpenAIReviewer(Reviewer):
                 # pass reuses the same cached prompt prefix.
                 "content": (
                     f"Untrusted changes:\n\n{code_changes}\n\n"
-                    f"Discovery pass: {pass_name}\n\n{focus_prompt}\n\n"
+                    # Shared by every pass, so it stays in the cached prefix.
+                    + (
+                        "Repository context from the head commit: callers of the "
+                        "changed functions and definitions of functions the change "
+                        "calls. Use it to check how the changed code is used and "
+                        "whether calls match their definitions. Report defects in "
+                        "the changes only.\n\n"
+                        f"{shared_context}\n\n"
+                        if shared_context
+                        else ""
+                    )
+                    + f"Discovery pass: {pass_name}\n\n{focus_prompt}\n\n"
                     f"Run the {pass_name} discovery pass on the changes above."
                 ),
             },
@@ -1066,6 +1097,7 @@ class OpenAIReviewer(Reviewer):
                 messages,
                 state,
                 allow_tools=not is_finalization_turn,
+                keep_tool_prefix=True,
             )
             tool_calls = message.tool_calls or []
             self._append_assistant(messages, message)
@@ -1412,7 +1444,13 @@ class OpenAIReviewer(Reviewer):
 
         raise ValueError("FINALIZE did not finish within the workflow turn limit")
 
-    def _request(self, messages: list[dict], state: ReviewState, allow_tools: bool):
+    def _request(
+        self,
+        messages: list[dict],
+        state: ReviewState,
+        allow_tools: bool,
+        keep_tool_prefix: bool = False,
+    ):
         with state.lock:
             if state.model_turns >= self.max_model_turns:
                 raise ValueError("AI review reached the workflow turn limit")
@@ -1467,11 +1505,17 @@ class OpenAIReviewer(Reviewer):
                 request["reasoning_effort"] = self.reasoning_effort
             elif self.model.startswith("kimi-k2"):
                 request["extra_body"] = {"thinking": {"type": self.kimi_thinking}}
-            if allow_tools and state.tool_calls < self.max_tool_calls:
+            tools_enabled = allow_tools and state.tool_calls < self.max_tool_calls
+            if tools_enabled or keep_tool_prefix:
                 request["tools"] = [
                     self._chat_tool(READ_FILE_TOOL),
                     self._chat_tool(SEARCH_CODE_TOOL),
                 ]
+                if not tools_enabled:
+                    # Kimi renders tool definitions before the messages, so
+                    # dropping them misses the cached prefix of the whole
+                    # conversation. Keep them and forbid calls instead.
+                    request["tool_choice"] = "none"
             else:
                 # JSON mode makes the model write tool calls as JSON text
                 # instead of native tool_calls (see json-mode-ab-v1), so it is

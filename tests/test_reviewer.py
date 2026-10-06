@@ -776,7 +776,9 @@ def test_reviewer_reserves_tool_free_turn_to_finalize_verify(tmp_path):
 
     assert len(result.issues) == 1
     finalization_request = completions.requests[-2]
-    assert "tools" not in finalization_request
+    # Tools stay in the request so the cached prefix holds; calls are forbidden.
+    assert finalization_request["tool_choice"] == "none"
+    assert "response_format" not in finalization_request
     assert "Verification tool and exploration budget is exhausted" in (
         finalization_request["messages"][-1]["content"]
     )
@@ -1472,7 +1474,9 @@ def test_repository_finalization_accepts_inconclusive_without_switching_basis(tm
     assert decision["verdict"] == "inconclusive"
     assert "failure_kind" not in decision
     final_request = completions.requests[-1]
-    assert "tools" not in final_request
+    # Tools stay in the request so the cached prefix holds; calls are forbidden.
+    assert final_request["tool_choice"] == "none"
+    assert "response_format" not in final_request
     assert "Keep basis=repository" in final_request["messages"][-1]["content"]
     assert "use basis=diff" not in final_request["messages"][-1]["content"]
     with pytest.raises(ValueError, match="basis must be repository"):
@@ -1780,7 +1784,9 @@ def test_verify_finalizes_immediately_when_tool_budget_is_spent(tmp_path):
     assert decision["verdict"] == "inconclusive"
     assert len(completions.requests) == 1
     request = completions.requests[0]
-    assert "tools" not in request
+    # Tools stay in the request so the cached prefix holds; calls are forbidden.
+    assert request["tool_choice"] == "none"
+    assert "response_format" not in request
     assert "budget is exhausted" in request["messages"][-1]["content"]
 
 
@@ -2000,3 +2006,53 @@ def test_discovery_units_are_capped(tmp_path):
     assert sum(u.count("File: ") for u in units) == 30
     with pytest.raises(ValueError):
         OpenAIReviewer(client=client, repository_root=tmp_path, model="test", discovery_mode="files")
+
+
+def test_change_context_shows_callers_of_changed_functions(tmp_path):
+    from src.change_context import build_change_context
+
+    (tmp_path / "lib.py").write_text(
+        "def compute_total(items, discount):\n    return sum(items) - discount\n"
+    )
+    (tmp_path / "app.py").write_text(
+        "from lib import compute_total\n\n\ndef checkout(cart):\n"
+        "    return compute_total(cart.items, cart.discount)\n"
+    )
+    changes = [
+        {"filename": "lib.py", "patch": "@@ -1,2 +1,2 @@\n def compute_total(items, discount):\n-    return sum(items)\n+    return sum(items) - discount"},
+        {"filename": "app.py", "patch": "@@ -4,2 +4,2 @@ def checkout(cart):\n-    return compute_total(cart.items)\n+    return compute_total(cart.items, cart.discount)"},
+    ]
+    context = build_change_context(changes, tmp_path)
+    assert "Callers of checkout" not in context  # nothing calls it
+    # compute_total encloses a changed line, so its callers are shown.
+    assert "Callers of compute_total (changed in lib.py)" in context
+    assert "5:     return compute_total(cart.items, cart.discount)" in context
+    assert build_change_context(changes, None) == ""
+
+
+def test_discovery_context_is_shared_by_every_pass(tmp_path):
+    (tmp_path / "lib.py").write_text("def compute_total(items):\n    return sum(items)\n")
+    (tmp_path / "app.py").write_text("x = compute_total([1])\n")
+    changes = [{"filename": "lib.py", "patch": "@@ -1,2 +1,2 @@\n def compute_total(items):\n-    return 0\n+    return sum(items)"}]
+    completions = FakeCompletions(
+        [response('{"candidates":[]}') for _ in range(4)], auto_empty_state_pass=False
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    reviewer = OpenAIReviewer(
+        client=client, repository_root=tmp_path, model="test", discovery_context="callers"
+    )
+    reviewer.discover_only(changes)
+    contents = [r["messages"][1]["content"] for r in completions.requests]
+    prefixes = {c.split("Discovery pass:")[0] for c in contents}
+    assert len(prefixes) == 1
+    assert "app.py:1" in prefixes.pop()
+
+
+def test_change_context_shows_definitions_of_called_functions(tmp_path):
+    from src.change_context import build_change_context
+
+    (tmp_path / "lib.py").write_text("def apply_discount(total, rate):\n    return total * rate\n")
+    changes = [{"filename": "app.py", "patch": "@@ -1,1 +1,1 @@\n-x = 1\n+price = apply_discount(total)"}]
+    context = build_change_context(changes, tmp_path)
+    assert "Definition of apply_discount, called by the change:" in context
+    assert "1: def apply_discount(total, rate):" in context
