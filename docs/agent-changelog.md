@@ -2625,3 +2625,37 @@ val-units-r1 的未缓存输入是 passes 模式的 3.6 倍。主要来源是每
 
 不能下的结论：只跑了 1 次，28 到 24 可能有一部分是波动，不能确定是减少上下文
 导致的。
+
+## 2026-10-06：verify 收尾轮的缓存修复 + discover 的调用方上下文（代码）
+
+### 缓存检查
+
+用 valfull-s2-r1 的 trace 按 stage 统计（prompt / 命中率）：discover 853k / 86%，
+verify 4.9M / 84%，deduplicate 150k / 33%，acquire_context 86k / 53%，
+finalize 21k / 0%。verify 未命中约 80 万，其中同一候选的后续轮次未命中 359k，
+但这些轮次新增的内容只有 155k。
+
+原因：工具预算用完后的收尾轮不传 tools，Kimi 把工具定义渲染在消息前面，
+去掉工具后整段对话（system + diff + 已有轮次）都没命中，单个案例每次 1–2 万
+tokens，一次运行 23 次。
+
+修复：verify 的收尾轮保留 tools，加 `tool_choice: "none"` 禁止调用；有 tools
+的请求不开 JSON 模式（和 CLAUDE.md 一致）。预计 verify 未命中能少约 20 万/次
+运行，下次跑完整 review 时用 Review tokens 一行确认。
+
+还没改的：discover 和 verify 的 system prompt 不同、tools 也不同，diff 在两个
+stage 各缓存一次。每个案例多付一次 diff 的未命中，量不大，先不动。
+
+### 调用方上下文（`--discovery-context callers`）
+
+discover 之前从 diff 里找出：
+- 改动所在的函数（hunk 头、未改动的定义行、改动的定义行）；
+- 新增代码调用的函数。
+
+然后在 head checkout 里用 rg 找改动函数的调用方（每个最多 3 处，前后 2 行），
+以及被调用函数的定义（前 7 行）。匹配超过 40 处的名字太通用，跳过。总长上限
+12000 字符，放在 diff 之后、`Discovery pass:` 之前，所有 pass 共享缓存。
+
+在 Mac 的仓库缓存上试了 4 个案例：上下文 0.8k–5.5k 字符，生成耗时 10–57 秒
+（VM 挂载盘上测的，Mac 本地应更快）。discourse-1 漏掉的 tempfile.size 循环，
+调用方片段里正好包含那段循环。
