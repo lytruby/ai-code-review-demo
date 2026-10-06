@@ -2695,3 +2695,27 @@ search_code：
   直接给出候选，所有 pass 的工具定义相同，前缀照样共享缓存。
 - 带工具的轮次不开 JSON 模式；不开这个选项时请求和原来完全一样。
 - 并行的 pass 共用 gateway，计数加了锁。
+
+### 2026-10-06 结果：val-dtools-r1（6c6adc7，discover-only，带工具，1 次）
+
+| | val-samp2（已有） | val-dtools-r1 |
+|---|---|---|
+| Core 命中 | 28 / 28 | 24/40 |
+| 候选误报 | 145 / 160 | 107 |
+| 候选精确率 | 15–16% | 18.3% |
+| 未缓存 / 缓存 / 输出 tokens | ~150k / 828k / 202k | 290k / 1513k / 178k |
+
+- `tool_choice: "none"` 在 Kimi 上可用，没有报错。
+- 工具用得不多：60% 的 pass 一次都没调，平均每个 pass 1.09 次（search_code 87、
+  read_file 43）；19 次被拒，10 次是同一轮并行调用超出预算，9 次参数不合法。
+- 丢了 8 条，其中 3 条 samp2 两次都命中过（cal-22532 鉴权抛通用 Error、
+  discourse-1 tempfile.size 循环、grafana-90939 双重检查锁）；新命中 1 条
+  （keycloak-36882 picocli.exit()）。
+- grafana-90939 一个候选都没有：几个 pass 读了 webassets.go 之后都认为加锁没问题。
+  有了工具，discover 开始自己“验证”并放弃候选，这和 discover 只负责多找候选的
+  定位冲突。
+- 用时约 24.6 分钟（`--jobs 2`），没有超时或 429。
+
+结论：召回下降、输入成本接近翻倍，`--discovery-tools` 保持关闭。
+
+不能下的结论：只跑了 1 次。
