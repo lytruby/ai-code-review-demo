@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.models import CandidateIssue, EvidenceRef, RequiredFact
+from src.models import CandidateIssue, EvidenceRef, RequiredFact, ReviewIssue
 import src.reviewer
 from src.reviewer import MAX_CANDIDATES, MAX_CANDIDATES_PER_DISCOVERY_PASS, OpenAIReviewer, ReviewState
 
@@ -149,7 +149,7 @@ def test_reviewer_runs_discover_verify_and_finalize_with_tool(tmp_path):
                     '"supporting_evidence":[{"source":"diff",'
                     '"file":"example.py","side":"after",'
                     '"text":"return a / b"}],'
-                f'"issue":{verified_issue}}}]}}'
+                f'"issue":{verified_issue},"scores":{{"certainty":4,"impact":3,"worth_reporting":4}}}}]}}'
             ),
             response('{"status":"complete","summary":"One issue found"}'),
         ]
@@ -647,7 +647,7 @@ def test_verify_rejects_repository_evidence_that_was_not_read():
         '"file":"models/record.py","text":"records are created on visit"}],'
         '"issue":{"file":"example.py","severity":"medium",'
         '"description":"Lookup may return nil before a visit",'
-        '"suggestion":"Handle the missing record"}}]}'
+        '"suggestion":"Handle the missing record"},"scores":{"certainty":4,"impact":3,"worth_reporting":4}}]}'
     )
 
     with pytest.raises(ValueError, match="successful read_file result"):
@@ -682,7 +682,7 @@ def test_verify_accepts_exact_repository_supporting_evidence():
         '"file":"models/record.py","text":"create_record_on_visit(user)"}],'
         '"issue":{"file":"example.py","severity":"medium",'
         '"description":"Lookup may return nil before a visit",'
-        '"suggestion":"Handle the missing record"}}]}'
+        '"suggestion":"Handle the missing record"},"scores":{"certainty":4,"impact":3,"worth_reporting":4}}]}'
     )
 
     verified, decisions = OpenAIReviewer._parse_decisions(
@@ -754,7 +754,7 @@ def test_reviewer_reserves_tool_free_turn_to_finalize_verify(tmp_path):
         '"text":"value = changed()"}],'
         '"issue":{"file":"example.py","severity":"low",'
         '"description":"Changed behavior",'
-        '"suggestion":"Handle the changed behavior"}}]}'
+        '"suggestion":"Handle the changed behavior"},"scores":{"certainty":4,"impact":3,"worth_reporting":4}}]}'
     )
     completions = FakeCompletions(
         [
@@ -807,7 +807,7 @@ def test_reviewer_verifies_candidates_in_separate_model_calls(tmp_path):
                 '"file":"second.py","side":"after","text":"second()"}],'
                 '"issue":{"file":"second.py",'
                 '"severity":"medium","description":"Second issue",'
-                '"suggestion":"Fix it"}}]}'
+                '"suggestion":"Fix it"},"scores":{"certainty":4,"impact":3,"worth_reporting":4}}]}'
             ),
             response('{"status":"complete","summary":"One issue found"}'),
         ]
@@ -1447,6 +1447,8 @@ def verification_decision(path="example.py", basis="diff", verdict="keep"):
         "reason": "Checked the available evidence",
         "supporting_evidence": [{"source": basis, "file": path, "side": "after", "text": "changed()"}],
         "issue": {"file": path, "severity": "medium", "description": "Changed behavior", "suggestion": "Fix behavior"}
+        if verdict in {"keep", "revise"} else None,
+        "scores": {"certainty": 4, "impact": 3, "worth_reporting": 4}
         if verdict in {"keep", "revise"} else None,
     }]})
 
@@ -2104,3 +2106,32 @@ def test_discovery_without_tools_keeps_the_json_mode_request(tmp_path):
     request = completions.requests[0]
     assert "tools" not in request and request["response_format"] == {"type": "json_object"}
     assert "Do not call tools in this\nstage." in request["messages"][0]["content"]
+
+
+def test_keep_decision_requires_scores():
+    candidate = verification_candidate()
+    decision = json.loads(verification_decision())
+    decision["decisions"][0]["scores"] = None
+    with pytest.raises(ValueError, match="scores"):
+        OpenAIReviewer._parse_decisions(json.dumps(decision), [candidate])
+    decision["decisions"][0]["scores"] = {"certainty": 6, "impact": 3, "worth_reporting": 4}
+    with pytest.raises(ValueError, match="certainty"):
+        OpenAIReviewer._parse_decisions(json.dumps(decision), [candidate])
+
+
+def test_report_rule_filters_kept_issues_and_records_scores(tmp_path):
+    reviewer, _ = verification_reviewer(tmp_path, [])
+    reviewer.report_rule = {"certainty": 5}
+    state = ReviewState(candidates=[verification_candidate()])
+    reviewer._verify_candidate = lambda *args, **kwargs: (
+        [ReviewIssue(file="example.py", severity="medium", description="d", suggestion="s")],
+        {"candidate_index": 0, "verdict": "keep", "scores": {"certainty": 4, "impact": 3, "worth_reporting": 4}},
+    )
+    reviewer._acquire_required_context = lambda *args: ([], 0, [])
+    assert reviewer._verify("File: example.py\nPatch:\n+changed()", state) == []
+    decisions = next(e for e in state.trace if e.get("type") == "stage_result")["decisions"]
+    assert decisions[0]["filtered_by_report_rule"] is True
+    reviewer.report_rule = {"certainty": 4}
+    assert len(reviewer._verify("File: example.py\nPatch:\n+changed()", ReviewState(candidates=[verification_candidate()]))) == 1
+    with pytest.raises(ValueError):
+        OpenAIReviewer(client=reviewer.client, repository_root=tmp_path, model="test", report_rule={"speed": 3})

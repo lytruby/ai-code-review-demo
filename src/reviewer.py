@@ -57,6 +57,7 @@ MAX_VERIFY_TURNS_PER_CANDIDATE = 4
 # One extra finalization turn lets an invalid final decision be corrected.
 MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE = 2
 MAX_FINALIZE_TURNS = 2
+SCORE_NAMES = ("certainty", "impact", "worth_reporting")
 
 
 def model_turn_budget(discovery_requests: int, max_candidates: int) -> int:
@@ -331,10 +332,23 @@ valid JSON with exactly one decision whose candidate_index is 0:
         "severity": "low | medium | high",
         "description": "Verified issue",
         "suggestion": "Verified suggestion"
-      }
+      },
+      "scores": {"certainty": 1, "impact": 1, "worth_reporting": 1}
     }
   ]
 }
+
+For keep and revise decisions, score the verified issue with integers from 1 to 5:
+- certainty: 5 = the evidence shows the failure happens; 3 = the defect is real
+  but whether it fails depends on conditions you could not confirm; 1 = mostly
+  speculative.
+- impact: 5 = data loss, security hole, crash or wrong result on a common path;
+  3 = wrong behavior in an uncommon case; 1 = cosmetic, naming, style or
+  maintainability only.
+- worth_reporting: 5 = a maintainer of this repository would want this comment
+  before merging; 1 = they would consider it noise.
+Score independently of the verdict; the workflow decides what is reported.
+For rejected and inconclusive decisions, scores must be null.
 
 For rejected and inconclusive decisions, issue must be null. For keep and revise decisions, issue
 must contain the verified issue and supporting_evidence must contain exact
@@ -421,6 +435,7 @@ class OpenAIReviewer(Reviewer):
         discovery_mode="passes",
         discovery_context="none",
         discovery_tools=False,
+        report_rule=None,
     ):
         if discovery_mode not in DISCOVERY_MODES:
             raise ValueError(f"discovery_mode must be one of {DISCOVERY_MODES}")
@@ -429,6 +444,14 @@ class OpenAIReviewer(Reviewer):
         self.discovery_mode = discovery_mode
         self.discovery_context = discovery_context
         self.discovery_tools = bool(discovery_tools)
+        # Minimum verify scores for an issue to be reported, e.g.
+        # {"certainty": 4, "worth_reporting": 3}; None reports every kept issue.
+        report_rule = dict(report_rule or {})
+        if set(report_rule) - set(SCORE_NAMES) or not all(
+            isinstance(v, int) and 1 <= v <= 5 for v in report_rule.values()
+        ):
+            raise ValueError(f"report_rule maps {SCORE_NAMES} to minimums from 1 to 5")
+        self.report_rule = report_rule
         if not 1 <= candidates_per_pass <= MAX_CANDIDATES_PER_DISCOVERY_PASS:
             raise ValueError("candidates_per_pass is out of range")
         if discovery_samples is None:
@@ -1062,6 +1085,9 @@ class OpenAIReviewer(Reviewer):
                 repository_context=repository_context,
                 initial_successful_tool_calls=acquired_tool_calls,
             )
+            if candidate_issues and not self._passes_report_rule(candidate_decision):
+                candidate_decision["filtered_by_report_rule"] = True
+                candidate_issues = []
             verified.extend(candidate_issues)
             decisions.append(candidate_decision)
 
@@ -1082,6 +1108,10 @@ class OpenAIReviewer(Reviewer):
             }
         )
         return verified
+
+    def _passes_report_rule(self, decision: dict) -> bool:
+        scores = decision.get("scores") or {}
+        return all(scores.get(name, 0) >= minimum for name, minimum in self.report_rule.items())
 
     def _verify_candidate(
         self,
@@ -2287,20 +2317,36 @@ class OpenAIReviewer(Reviewer):
                         f"({candidates[index].file}); mention other files in the description"
                     )
                 verified.append(verified_issue)
+                scores = cls._parse_scores(raw_decision.get("scores"))
 
-            decisions.append(
-                {
-                    "candidate_index": index,
-                    "verdict": verdict,
-                    "basis": basis,
-                    "reason": reason,
-                    "supporting_evidence": raw_decision.get(
-                        "supporting_evidence", []
-                    ),
-                }
-            )
+            decision = {
+                "candidate_index": index,
+                "verdict": verdict,
+                "basis": basis,
+                "reason": reason,
+                "supporting_evidence": raw_decision.get("supporting_evidence", []),
+            }
+            if verdict in {"keep", "revise"}:
+                decision["scores"] = scores
+                decision["issue_description"] = verified_issue.description
+            decisions.append(decision)
 
         return verified, decisions
+
+    @staticmethod
+    def _parse_scores(raw_scores: object) -> dict:
+        if not isinstance(raw_scores, dict):
+            raise ValueError(
+                "keep and revise decisions need scores with certainty, impact "
+                "and worth_reporting from 1 to 5"
+            )
+        scores = {}
+        for name in SCORE_NAMES:
+            value = raw_scores.get(name)
+            if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 5:
+                raise ValueError(f"scores.{name} must be an integer from 1 to 5")
+            scores[name] = value
+        return scores
 
     @classmethod
     def _validate_supporting_evidence(

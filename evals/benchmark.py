@@ -270,6 +270,8 @@ def main() -> None:
                         help="Add callers of changed functions and definitions of called functions to the discovery prompt")
     parser.add_argument("--discovery-tools", action="store_true",
                         help="Let each discovery pass call read_file and search_code a few times")
+    parser.add_argument("--report-rule",
+                        help="Report only verified issues whose scores reach these minimums, e.g. certainty=4,worth_reporting=3")
     parser.add_argument("--jobs", type=int, default=1,
                         help="Review and score up to this many cases concurrently; cost is unchanged, provider rate limits apply")
     args = parser.parse_args()
@@ -286,6 +288,14 @@ def main() -> None:
         review_settings["discovery_samples"] = args.discovery_samples
     if args.discovery_mode is not None:
         review_settings["discovery_mode"] = args.discovery_mode
+    if args.report_rule:
+        try:
+            review_settings["report_rule"] = {
+                name.strip(): int(value)
+                for name, value in (item.split("=") for item in args.report_rule.split(","))
+            }
+        except ValueError:
+            parser.error("--report-rule must look like certainty=4,worth_reporting=3")
     if args.discovery_tools:
         review_settings["discovery_tools"] = True
     if args.discovery_context is not None:

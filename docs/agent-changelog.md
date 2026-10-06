@@ -2727,3 +2727,15 @@ Liu 认为这些规则是照着个别漏报补的，属于过拟合。撤掉 VER
 里“只确认缺陷时改写影响”的提示也去掉。保留收尾轮 2 次（非法决定可纠正一次）和
 file 不一致时更清楚的报错，这两项是协议层面的修复，和具体案例无关。下一步重新
 设计 verify。
+
+## 2026-10-06：verify 输出分项打分，报告规则可配置（代码）
+
+目标是降低误报，召回尽量不降。两次 valfull-s2 里 verify 留下 182 条、其中 139 条
+误报，而 verify 只丢了 11 条已发现的 golden，追回召回的空间很小。
+
+- keep/revise 决定必须带 `scores`：certainty（缺陷是否真的发生）、impact（影响多大）、
+  worth_reporting（维护者是否想看到），都是 1–5 的整数，缺失或越界走格式纠正。
+- 分数和 issue 描述记进 trace 的 decision，方便按分数离线算精确率和召回。
+- `report_rule`（CLI `--report-rule certainty=4,worth_reporting=3`）由程序按最低分过滤；
+  默认不过滤，先跑一次收集分数，再按结果定阈值。
+- 打分说明放在 VERIFY_PROMPT（system）里，不影响缓存前缀。
