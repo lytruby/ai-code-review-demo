@@ -163,6 +163,7 @@ def test_reviewer_runs_discover_verify_and_finalize_with_tool(tmp_path):
 
     assert result.summary == "One issue found"
     assert result.issues[0].file == "example.py"
+    assert (result.issues[0].start_line, result.issues[0].end_line) == (2, 2)
     assert len(completions.requests) == 7
     assert "Stage: DISCOVER" in completions.requests[0]["messages"][0]["content"]
     discover_prompt = completions.requests[0]["messages"][0]["content"]

@@ -28,6 +28,7 @@ from src.models import (
     review_issue_from_dict,
 )
 from src.change_context import build_change_context
+from src.locate import locate_issue
 from src.tools import READ_FILE_TOOL, SEARCH_CODE_TOOL
 from src.tool_gateway import ToolGateway, ToolProposal
 
@@ -413,6 +414,7 @@ class ReviewState:
     tool_calls: int = 0
     api_attempts: int = 0
     tool_gateway: ToolGateway | None = field(default=None, repr=False)
+    patches: dict[str, str] = field(default_factory=dict, repr=False)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
@@ -589,7 +591,7 @@ class OpenAIReviewer(Reviewer):
         return resolved
 
     def review(self, changes) -> ReviewResult:
-        state = ReviewState()
+        state = ReviewState(patches={c["filename"]: c.get("patch") or "" for c in changes})
         self.last_state = state
         self.last_trace = state.trace
         code_changes = "\n\n".join(
@@ -632,7 +634,7 @@ class OpenAIReviewer(Reviewer):
         Used to measure candidate coverage of known issues cheaply; the claims
         are unverified and must not be published as a review.
         """
-        state = ReviewState()
+        state = ReviewState(patches={c["filename"]: c.get("patch") or "" for c in changes})
         self.last_state = state
         self.last_trace = state.trace
         code_changes = "\n\n".join(
@@ -641,17 +643,19 @@ class OpenAIReviewer(Reviewer):
         )
         state.candidates = self._discover(code_changes, state, changes)
         state.stage = "complete"
+        issues = []
+        for candidate in state.candidates:
+            issue = ReviewIssue(
+                file=candidate.file,
+                severity=candidate.severity,
+                description=candidate.claim,
+                suggestion="",
+            )
+            self._locate(issue, [], candidate, state)
+            issues.append(issue)
         return ReviewResult(
             summary=f"Discovery only: {len(state.candidates)} unverified candidate(s).",
-            issues=[
-                ReviewIssue(
-                    file=candidate.file,
-                    severity=candidate.severity,
-                    description=candidate.claim,
-                    suggestion="",
-                )
-                for candidate in state.candidates
-            ],
+            issues=issues,
             status="complete",
         )
 
@@ -1088,6 +1092,8 @@ class OpenAIReviewer(Reviewer):
             if candidate_issues and not self._passes_report_rule(candidate_decision):
                 candidate_decision["filtered_by_report_rule"] = True
                 candidate_issues = []
+            for issue in candidate_issues:
+                self._locate(issue, candidate_decision.get("supporting_evidence") or [], candidate, state)
             verified.extend(candidate_issues)
             decisions.append(candidate_decision)
 
@@ -1108,6 +1114,24 @@ class OpenAIReviewer(Reviewer):
             }
         )
         return verified
+
+    def _locate(self, issue: ReviewIssue, supporting_evidence: list, candidate: CandidateIssue, state: ReviewState) -> None:
+        excerpts = [
+            reference["text"]
+            for reference in supporting_evidence
+            if isinstance(reference, dict)
+            and reference.get("file") == issue.file
+            and reference.get("side") != "before"
+            and isinstance(reference.get("text"), str)
+        ]
+        excerpts += [
+            reference.text
+            for reference in candidate.evidence
+            if (reference.file or candidate.file) == issue.file and reference.side == "after"
+        ]
+        found = locate_issue(issue.file, excerpts, state.patches.get(issue.file, ""), self.repository_root)
+        if found is not None:
+            issue.start_line, issue.end_line = found
 
     def _passes_report_rule(self, decision: dict) -> bool:
         scores = decision.get("scores") or {}

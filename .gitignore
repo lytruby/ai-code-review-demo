@@ -18,3 +18,4 @@ evals/runs/**/evaluation.json
 evals/runs/**/error*.json
 evals/benchmark-data/
 evals/benchmark-runs/
+evals/reviewbench/

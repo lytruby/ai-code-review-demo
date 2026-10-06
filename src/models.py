@@ -13,6 +13,9 @@ class ReviewIssue:
     severity: Severity
     description: str
     suggestion: str
+    # Head-version line range, filled in by the workflow after verification.
+    start_line: int | None = None
+    end_line: int | None = None
 
 
 @dataclass
