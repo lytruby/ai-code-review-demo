@@ -303,26 +303,13 @@ combines one supported impact with one unsupported impact, or proposes the
 wrong remediation. Use rejected only when the core defect or causal chain is
 itself disproved or no concrete actionable defect remains after correction.
 
-Separate the defect from its impact. If the changed code demonstrably behaves
-incorrectly (for example a comparison that can never be true, a wrong constant,
-or a value that is dropped), keep or revise it and narrow the impact to what the
-evidence supports; do not return inconclusive only because the downstream
-impact is unconfirmed. If the evidence you read disproves the candidate's
-mechanism but shows a different concrete defect in the same changed code path,
-revise the candidate to that defect instead of rejecting it.
-
-A changed test that asserts a wrong expected value, cannot fail for the
-regression it targets, or contradicts the implementation it tests is a concrete
-defect; do not reject it as a test-quality or coverage concern.
-
 Do not treat a behavior as correct merely because it appears intentional or
 could be a product choice. Intent is evidence only when the supplied diff,
 tests, documentation, or successfully read repository context establishes the
 intended contract. Without such evidence, judge the observable behavior and
 revise an overstated candidate to the narrowest supported defect.
 
-Do not report defects outside the candidate's changed code path. When
-verification is complete, return only
+Do not create a new candidate. When verification is complete, return only
 valid JSON with exactly one decision whose candidate_index is 0:
 {
   "decisions": [
@@ -1150,9 +1137,7 @@ class OpenAIReviewer(Reviewer):
                     "available. Do not request another tool. "
                     f"Keep basis={expected_basis}. Keep/revise still requires "
                     "valid supporting evidence for that basis. If evidence is "
-                    "insufficient, return inconclusive with issue=null. If the "
-                    "defect itself is supported and only its impact is uncertain, "
-                    "revise it to the supported impact instead. Return "
+                    "insufficient, return inconclusive with issue=null. Return "
                     "exactly one decision with candidate_index=0.",
                 )
 
