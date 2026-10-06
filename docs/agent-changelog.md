@@ -2765,3 +2765,35 @@ file 不一致时更清楚的报错，这两项是协议层面的修复，和具
 
 结论：模型给自己的打分基本区分不了 TP 和 FP，impact 甚至反向。只有
 certainty>=4 去掉 6 条 FP 不丢 TP，但样本只有 6 条。默认仍不过滤。
+
+## 2026-10-06：接入 ReviewBench，测试集首跑（rb-test-v1）
+
+代码 aa93121 给每个 issue 补上 head 版本的起止行号（先在 diff 的 head 侧找证据
+原文，再在 head 文件里找，都找不到就用第一行新增行）。2b6c9e4 新增
+`evals/reviewbench.py`：从 review-bench 镜像 blobless clone，按 base...head
+取 diff（和它的 judge 一致），输出它的 findings 格式，再调它的 `npm run judge`。
+ReviewBench 仓库本身克隆在 `evals/reviewbench/`，不入库。
+
+配置：当前默认（discover 采样 2 次、不过滤），Kimi K3，25 个测试 PR，1 次。
+Judge 的 pi SDK 不认识 gpt-6.1-sol，改用 gpt-5.5（官方榜单用 Claude Sonnet 5，
+分数不能直接和榜单比）。
+
+| | 宏平均 | 微平均 |
+|---|---:|---:|
+| Grounded P / R | 81.7% / 22.7% | 85.9% / 22.2% |
+| Augmented P / R | 88.2% / 36.4% | 89.2% / 38.0% |
+
+- 176 条发现：匹配 golden TP 67，judge 判为新 TP 90，匹配 golden FP 11，新 FP 8。
+- 按 severity 的召回（宏平均 GR / AR）：high 32.4% / 39.6%，medium 28.6% / 42.7%，
+  low 14.0% / 29.4%。correctness 最高（GR 38.2%），security 7%、maintainability
+  8%、api-architecture 0%。
+- Review tokens（25 个 PR）：未命中 1.90M，命中 24.16M，输出 717k；每个 PR 约
+  76k / 966k / 29k。simnaut_emdash_2 一个 PR 就用了约 12.9M 缓存 token、33 分钟。
+- Judge 成本约 $18.9（自己从 OpenAI usage 按 gpt-5.5 单价算，judge 本身不报成本），
+  510 次请求，输入 13.7M（缓存 11.9M）。平均约 $0.75/PR，大 PR 超过 $1。
+  4 并发会撞 OpenAI 500k TPM 限流，需 `--jobs 1`。
+- 中途 Kimi、OpenAI 余额各用完一次，充值后同一运行名续跑完成。
+
+不能下的结论：只跑 1 次；judge 模型和官方不同。精确率很高说明在 ReviewBench 上
+“报得少而准”，召回是主要短板，和我们自己 benchmark 的结论一致，但两个
+benchmark 的 golden 口径不同，数值不能直接对比。
