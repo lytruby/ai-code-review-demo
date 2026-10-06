@@ -1979,18 +1979,16 @@ def test_unit_discovery_reviews_each_unit_with_surrounding_code(tmp_path):
 
     units = reviewer._discovery_units(changes)
     assert len(units) == 3
-    assert "Code before the hunk (lines 1-9)" in units[0]
-    assert "Code after the hunk (lines 11-26)" in units[0]
-    assert "10: line10" not in units[0]  # the changed line is only in the hunk
-    assert "Code before" not in units[2]  # b.py is not in the checkout
+    assert "Surrounding code after the change (lines 1-41)" in units[0]
+    assert "30: line30" in units[0] and "31: line31" not in units[0].split("lines 1-41")[0]
+    assert "Surrounding code" not in units[2]  # b.py is not in the checkout
 
     reviewer.discover_only(changes)
     contents = [r["messages"][1]["content"] for r in completions.requests]
     assert len(contents) == 3
-    assert all("Review only this unit" in c for c in contents)
-    # Every unit request shares the diff and the checklist as its cached prefix.
-    prefixes = {c.split("Discovery pass:")[0] for c in contents}
-    assert len(prefixes) == 1 and "Check every changed line" in prefixes.pop()
+    assert all("Review only the unit below" in c for c in contents)
+    # Every unit request shares the diff as its cached prefix.
+    assert len({c.split("Discovery pass:")[0] for c in contents}) == 1
 
 
 def test_discovery_units_are_capped(tmp_path):
