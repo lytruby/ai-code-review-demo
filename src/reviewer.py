@@ -45,7 +45,8 @@ MAX_DEDUPLICATE_TURNS = 2
 MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
 MAX_CONTEXT_TURNS_PER_FACT = 3
 MAX_VERIFY_TURNS_PER_CANDIDATE = 4
-MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE = 1
+# One extra finalization turn lets an invalid final decision be corrected.
+MAX_VERIFY_FINALIZATION_TURNS_PER_CANDIDATE = 2
 MAX_FINALIZE_TURNS = 2
 
 
@@ -263,13 +264,32 @@ combines one supported impact with one unsupported impact, or proposes the
 wrong remediation. Use rejected only when the core defect or causal chain is
 itself disproved or no concrete actionable defect remains after correction.
 
+Separate the defect from its impact. If the changed code demonstrably behaves
+incorrectly (for example a comparison that can never be true, a wrong constant,
+or a value that is dropped), keep or revise it and narrow the impact to what the
+evidence supports; do not return inconclusive only because the downstream
+impact is unconfirmed. If the evidence you read disproves the candidate's
+mechanism but shows a different concrete defect in the same changed code path,
+revise the candidate to that defect instead of rejecting it.
+
+Do not reject a candidate on library, framework, or runtime behavior that you
+recall but have not established from the diff or a successfully read source.
+Read the relevant source when it is in the repository. If you cannot, and the
+defect holds unless that behavior applies, keep or revise the candidate and
+state the assumption in the description.
+
+A changed test that asserts a wrong expected value, cannot fail for the
+regression it targets, or contradicts the implementation it tests is a concrete
+defect; do not reject it as a test-quality or coverage concern.
+
 Do not treat a behavior as correct merely because it appears intentional or
 could be a product choice. Intent is evidence only when the supplied diff,
 tests, documentation, or successfully read repository context establishes the
 intended contract. Without such evidence, judge the observable behavior and
 revise an overstated candidate to the narrowest supported defect.
 
-Do not create a new candidate. When verification is complete, return only
+Do not report defects outside the candidate's changed code path. When
+verification is complete, return only
 valid JSON with exactly one decision whose candidate_index is 0:
 {
   "decisions": [
@@ -957,7 +977,9 @@ class OpenAIReviewer(Reviewer):
                     "available. Do not request another tool. "
                     f"Keep basis={expected_basis}. Keep/revise still requires "
                     "valid supporting evidence for that basis. If evidence is "
-                    "insufficient, return inconclusive with issue=null. Return "
+                    "insufficient, return inconclusive with issue=null. If the "
+                    "defect itself is supported and only its impact is uncertain, "
+                    "revise it to the supported impact instead. Return "
                     "exactly one decision with candidate_index=0.",
                 )
 
@@ -2087,7 +2109,8 @@ class OpenAIReviewer(Reviewer):
                 verified_issue = review_issue_from_dict(raw_issue)
                 if verified_issue.file != candidates[index].file:
                     raise ValueError(
-                        "verified issue file must match its candidate file"
+                        "verified issue file must match its candidate file "
+                        f"({candidates[index].file}); mention other files in the description"
                     )
                 verified.append(verified_issue)
 

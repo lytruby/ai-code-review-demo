@@ -1527,7 +1527,7 @@ def test_textual_tool_detector_rejects_ambiguous_or_invalid_requests(output):
     response(tool_calls=[SimpleNamespace(id="late-tool", function=SimpleNamespace(name="read_file", arguments='{"path":"example.py"}'))]),
 ])
 def test_finalization_never_executes_tools_even_if_model_requests_them(tmp_path, final_response):
-    reviewer, _ = verification_reviewer(tmp_path, [*[response("{}") for _ in range(4)], final_response])
+    reviewer, _ = verification_reviewer(tmp_path, [*[response("{}") for _ in range(4)], final_response, final_response])
     state = ReviewState(stage="verify")
     issues, decision = reviewer._verify_candidate(
         "File: example.py\nPatch:\n+changed()", verification_candidate(),
@@ -1574,7 +1574,7 @@ def test_candidate_turn_exhaustion_preserves_prior_issues_and_continues_review(t
     reviewer, _ = verification_reviewer(tmp_path, [
         response(json.dumps({"candidates": [asdict(c) for c in candidates]})),
         response(verification_decision("first.py")),
-        *[response('{"decisions":[]}') for _ in range(5)],
+        *[response('{"decisions":[]}') for _ in range(6)],
         response(verification_decision("last.py")),
         response('{"status":"complete","summary":"Two verified issues"}'),
     ])
@@ -1945,3 +1945,19 @@ def test_discovery_warms_cache_then_runs_remaining_passes_concurrently(tmp_path)
     assert events[:2] == [("start", "correctness"), ("end", "correctness")]
     stage = next(e for e in state.trace if e.get("type") == "stage_result" and e["stage"] == "discover")
     assert list(stage["pass_candidate_counts"]) == [name for name, _ in reviewer.discovery_passes]
+
+
+def test_invalid_final_decision_gets_one_correction_turn(tmp_path):
+    reviewer, completions = verification_reviewer(tmp_path, [
+        *[response("{}") for _ in range(4)],
+        response(verification_decision().replace('"file": "example.py", "severity"', '"file": "other.py", "severity"')),
+        response(verification_decision()),
+    ])
+    state = ReviewState(stage="verify")
+    issues, decision = reviewer._verify_candidate(
+        "File: example.py\nPatch:\n+changed()", verification_candidate(),
+        0, state, repository_context=[], initial_successful_tool_calls=0,
+    )
+    assert decision["verdict"] == "keep"
+    assert len(issues) == 1
+    assert "mention other files in the description" in completions.requests[-1]["messages"][-1]["content"]
