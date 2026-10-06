@@ -2056,3 +2056,51 @@ def test_change_context_shows_definitions_of_called_functions(tmp_path):
     context = build_change_context(changes, tmp_path)
     assert "Definition of apply_discount, called by the change:" in context
     assert "1: def apply_discount(total, rate):" in context
+
+
+def test_discovery_tools_run_through_the_gateway_within_the_pass_budget(tmp_path):
+    from src.reviewer import DISCOVER_TOOL_CALLS_PER_PASS
+
+    (tmp_path / "lib.py").write_text("def compute_total(items):\n    return sum(items)\n")
+
+    def read_call(index):
+        return SimpleNamespace(
+            id=f"discover-read-{index}",
+            function=SimpleNamespace(name="read_file", arguments='{"path":"lib.py"}'),
+        )
+
+    completions = FakeCompletions([
+        response(tool_calls=[read_call(0)]),
+        # Asks for more calls than the pass has left; the extra ones are denied.
+        response(tool_calls=[read_call(i) for i in range(1, DISCOVER_TOOL_CALLS_PER_PASS + 1)]),
+        response('{"candidates":[]}'),
+    ])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    reviewer = OpenAIReviewer(
+        client=client, repository_root=tmp_path, model="test",
+        discovery_passes=["correctness"], discovery_tools=True,
+    )
+    reviewer.discover_only([{"filename": "app.py", "patch": "@@ -1 +1 @@\n-x = 0\n+x = compute_total([1])"}])
+
+    first, second, final = completions.requests[:3]
+    assert "You may call read_file and search_code" in first["messages"][0]["content"]
+    assert "tools" in first and "response_format" not in first
+    # Tools stay in the final request so the prefix is cached; calls are forbidden.
+    assert final["tool_choice"] == "none" and "response_format" not in final
+    assert "tool budget for this discovery pass is exhausted" in final["messages"][-1]["content"]
+    decisions = [e for e in reviewer.last_trace if e.get("type") == "tool_gateway_decision"]
+    assert [d["allowed"] for d in decisions] == [True] * DISCOVER_TOOL_CALLS_PER_PASS + [False]
+    tool_messages = [m for m in final["messages"] if m.get("role") == "tool"]
+    assert len(tool_messages) == DISCOVER_TOOL_CALLS_PER_PASS + 1
+
+
+def test_discovery_without_tools_keeps_the_json_mode_request(tmp_path):
+    completions = FakeCompletions([response('{"candidates":[]}')])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    reviewer = OpenAIReviewer(
+        client=client, repository_root=tmp_path, model="test", discovery_passes=["correctness"]
+    )
+    reviewer.discover_only([{"filename": "app.py", "patch": "@@ -1 +1 @@\n-x = 0\n+x = 1"}])
+    request = completions.requests[0]
+    assert "tools" not in request and request["response_format"] == {"type": "json_object"}
+    assert "Do not call tools in this\nstage." in request["messages"][0]["content"]

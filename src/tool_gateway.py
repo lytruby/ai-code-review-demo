@@ -41,7 +41,7 @@ class ToolGateway:
 
         if source not in {"model", "workflow"}:
             return deny("invalid_source", "Only formal tool calls or workflow proposals are accepted")
-        if not tools_allowed or stage not in {"verify", "acquire_context"}:
+        if not tools_allowed or stage not in {"discover", "verify", "acquire_context"}:
             return deny("stage_denied", "Tools are disabled in the current workflow phase")
         if source == "model" and (not isinstance(proposal.call_id, str) or not proposal.call_id):
             return deny("missing_call_id", "A formal model tool call must have a call id")

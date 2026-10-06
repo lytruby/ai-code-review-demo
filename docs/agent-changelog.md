@@ -2682,3 +2682,16 @@ discover 之前从 diff 里找出：
 都没超过 samp2 的 28。
 
 不能下的结论：只跑了 1 次，26 和 28 在波动范围内。
+
+## 2026-10-06：discover 可以自己调用工具（代码，`--discovery-tools`）
+
+前面几次都是由程序预先挑好代码放进 prompt（按单元的上下文、调用方上下文），
+模型不能自己决定去看什么。这次让每个 discover pass 都能调用 read_file 和
+search_code：
+- 请求里带上工具，由模型自己决定要不要调，不另加“是否需要工具”的判断步骤。
+- 调用都经过 tool gateway，gateway 允许 discover 阶段；每个 pass 最多 3 次，
+  超出的调用会被拒绝。discover 的预算另外加到总预算上，不占 verify 的。
+- 预算用完后的那一轮保留工具定义，用 `tool_choice: "none"` 禁止调用，要求
+  直接给出候选，所有 pass 的工具定义相同，前缀照样共享缓存。
+- 带工具的轮次不开 JSON 模式；不开这个选项时请求和原来完全一样。
+- 并行的 pass 共用 gateway，计数加了锁。

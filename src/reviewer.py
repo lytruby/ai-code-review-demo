@@ -48,6 +48,8 @@ UNIT_CONTEXT_LINES = 30
 DISCOVERY_MODES = ("passes", "units")
 DISCOVERY_CONTEXTS = ("none", "callers")
 MAX_DISCOVER_TURNS = 2
+# Repository tool calls each discovery request may make when discovery_tools is on.
+DISCOVER_TOOL_CALLS_PER_PASS = 3
 MAX_DEDUPLICATE_TURNS = 2
 MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
 MAX_CONTEXT_TURNS_PER_FACT = 3
@@ -205,6 +207,15 @@ concerns in this pass.
 """,
     ),
 )
+
+DISCOVER_NO_TOOLS = "Do not call tools in this\nstage."
+DISCOVER_WITH_TOOLS = f"""\
+You may call read_file and search_code, at most {DISCOVER_TOOL_CALLS_PER_PASS} times in this
+stage, to read repository code at the head commit when the diff alone is not
+enough to judge a change: for example the definition of a function the change
+calls, how a changed function is used, or a schema or constant it depends on.
+Do not call tools for what the diff already shows. Candidates and their
+evidence must still point to the changed code."""
 
 UNIT_DISCOVERY_PROMPT = """\
 Review only the unit below, which is one part of the changes above. Check every
@@ -422,6 +433,7 @@ class OpenAIReviewer(Reviewer):
         discovery_samples=None,
         discovery_mode="passes",
         discovery_context="none",
+        discovery_tools=False,
     ):
         if discovery_mode not in DISCOVERY_MODES:
             raise ValueError(f"discovery_mode must be one of {DISCOVERY_MODES}")
@@ -429,6 +441,7 @@ class OpenAIReviewer(Reviewer):
             raise ValueError(f"discovery_context must be one of {DISCOVERY_CONTEXTS}")
         self.discovery_mode = discovery_mode
         self.discovery_context = discovery_context
+        self.discovery_tools = bool(discovery_tools)
         if not 1 <= candidates_per_pass <= MAX_CANDIDATES_PER_DISCOVERY_PASS:
             raise ValueError("candidates_per_pass is out of range")
         if discovery_samples is None:
@@ -457,6 +470,14 @@ class OpenAIReviewer(Reviewer):
         self.max_model_turns = model_turn_budget(
             len(self.discovery_passes) * discovery_samples, max_candidates
         )
+        if self.discovery_tools:
+            # Discovery gets its own allowance so it never spends verify's budget;
+            # each tool call needs at most one extra model turn.
+            discovery_requests = max(
+                len(self.discovery_passes) * discovery_samples, MAX_DISCOVERY_UNITS
+            )
+            self.max_tool_calls += DISCOVER_TOOL_CALLS_PER_PASS * discovery_requests
+            self.max_model_turns += DISCOVER_TOOL_CALLS_PER_PASS * discovery_requests
         configured_model = model or os.environ.get("LLM_MODEL")
         self.provider = self._resolve_provider(provider, configured_model)
         self.request_timeout = float(os.environ.get("LLM_TIMEOUT", "120"))
@@ -896,6 +917,9 @@ class OpenAIReviewer(Reviewer):
                 "role": "system",
                 "content": f"{REVIEW_PROMPT}\n\n" + DISCOVER_PROMPT.replace(
                     "{max_candidates}", str(self.candidates_per_pass)
+                ).replace(
+                    DISCOVER_NO_TOOLS,
+                    DISCOVER_WITH_TOOLS if self.discovery_tools else DISCOVER_NO_TOOLS,
                 ),
             },
             {
@@ -921,9 +945,48 @@ class OpenAIReviewer(Reviewer):
             },
         ]
 
-        for _ in range(MAX_DISCOVER_TURNS):
-            message = self._request(messages, state, allow_tools=False)
+        output_turns = 0
+        pass_tool_calls = 0
+        while output_turns < MAX_DISCOVER_TURNS:
+            tools_enabled = (
+                self.discovery_tools and pass_tool_calls < DISCOVER_TOOL_CALLS_PER_PASS
+            )
+            message = self._request(
+                messages,
+                state,
+                allow_tools=tools_enabled,
+                keep_tool_prefix=self.discovery_tools,
+            )
             self._append_assistant(messages, message)
+            if message.tool_calls and tools_enabled:
+                remaining = DISCOVER_TOOL_CALLS_PER_PASS - pass_tool_calls
+                allowed, denied = message.tool_calls[:remaining], message.tool_calls[remaining:]
+                pass_tool_calls += len(allowed)
+                self._execute_tool_calls(messages, allowed, state, candidate_index=-1)
+                if denied:
+                    # Every call needs a tool message, so calls over budget are denied.
+                    self._execute_tool_calls(
+                        messages, denied, state, candidate_index=-1, tools_allowed=False
+                    )
+                if pass_tool_calls >= DISCOVER_TOOL_CALLS_PER_PASS:
+                    self._append_feedback(
+                        messages,
+                        state,
+                        "The tool budget for this discovery pass is exhausted. "
+                        "Return the candidates JSON now.",
+                    )
+                continue
+            output_turns += 1
+            if message.tool_calls:
+                self._execute_tool_calls(
+                    messages, message.tool_calls, state, candidate_index=-1,
+                    tools_allowed=False,
+                )
+                self._append_feedback(
+                    messages, state,
+                    "Tools are disabled now. Return the candidates JSON.",
+                )
+                continue
             try:
                 candidates, rejections = self._parse_candidate_batch(
                     message.content or "",
@@ -1398,14 +1461,17 @@ class OpenAIReviewer(Reviewer):
         self, proposal: ToolProposal, state: ReviewState, *,
         candidate_index: int, source: str, tools_allowed: bool = True,
     ) -> str:
-        if state.tool_gateway is None:
-            state.tool_gateway = ToolGateway(
-                self.repository_root, max_calls=max(0, self.max_tool_calls - state.tool_calls),
+        # Discovery passes run in parallel threads and share the gateway budget.
+        with state.lock:
+            if state.tool_gateway is None:
+                state.tool_gateway = ToolGateway(
+                    self.repository_root,
+                    max_calls=max(0, self.max_tool_calls - state.tool_calls),
+                )
+            outcome = state.tool_gateway.execute(
+                proposal, source=source, stage=state.stage, tools_allowed=tools_allowed,
             )
-        outcome = state.tool_gateway.execute(
-            proposal, source=source, stage=state.stage, tools_allowed=tools_allowed,
-        )
-        state.tool_calls += int(outcome.charged)
+            state.tool_calls += int(outcome.charged)
         state.trace.append({
             "type": "tool_gateway_decision", "stage": state.stage,
             "candidate_index": candidate_index, "origin": source,

@@ -197,12 +197,13 @@ def run_case(
             ) from error
         return result, getattr(reviewer, "last_trace", [])
 
-    # Unit discovery and caller context read the repository, so they need the checkout.
+    # Unit discovery, caller context and discovery tools read the repository.
     settings = reviewer_settings or {}
     needs_checkout = (
         not discover_only
         or settings.get("discovery_mode") == "units"
         or settings.get("discovery_context", "none") != "none"
+        or settings.get("discovery_tools", False)
     )
     if repository_cache is not None and needs_checkout:
         repository_root = prepare_cached_repository(

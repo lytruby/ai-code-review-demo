@@ -268,6 +268,8 @@ def main() -> None:
                         help="Discover with category passes over the whole diff, or once per unit of the diff")
     parser.add_argument("--discovery-context", choices=("none", "callers"),
                         help="Add callers of changed functions and definitions of called functions to the discovery prompt")
+    parser.add_argument("--discovery-tools", action="store_true",
+                        help="Let each discovery pass call read_file and search_code a few times")
     parser.add_argument("--jobs", type=int, default=1,
                         help="Review and score up to this many cases concurrently; cost is unchanged, provider rate limits apply")
     args = parser.parse_args()
@@ -284,6 +286,8 @@ def main() -> None:
         review_settings["discovery_samples"] = args.discovery_samples
     if args.discovery_mode is not None:
         review_settings["discovery_mode"] = args.discovery_mode
+    if args.discovery_tools:
+        review_settings["discovery_tools"] = True
     if args.discovery_context is not None:
         review_settings["discovery_context"] = args.discovery_context
     if review_settings and args.source_run:

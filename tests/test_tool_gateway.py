@@ -8,7 +8,8 @@ from src.tool_gateway import ToolGateway, ToolProposal
 @pytest.mark.parametrize("source,stage,allowed,call_id,code", [
     ("text", "verify", True, None, "invalid_source"),
     ("model", "verify", True, None, "missing_call_id"),
-    ("model", "discover", True, "call", "stage_denied"),
+    ("model", "discover", False, "call", "stage_denied"),
+    ("model", "deduplicate", True, "call", "stage_denied"),
     ("workflow", "finalize", True, None, "stage_denied"),
     ("model", "verify", False, "call", "stage_denied"),
 ])
