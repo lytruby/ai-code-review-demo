@@ -2797,3 +2797,22 @@ Judge 的 pi SDK 不认识 gpt-6.1-sol，改用 gpt-5.5（官方榜单用 Claude
 不能下的结论：只跑 1 次；judge 模型和官方不同。精确率很高说明在 ReviewBench 上
 “报得少而准”，召回是主要短板，和我们自己 benchmark 的结论一致，但两个
 benchmark 的 golden 口径不同，数值不能直接对比。
+
+## 2026-10-06：放松 verify（`--verify-policy refute`，rb-refute-small-v1），不采用
+
+代码 005fee9：新增 `verify_policy="refute"`，verify 只有读到反证才驳回，inconclusive
+候选按未验证照报。默认仍是 strict，strict 的提示词不变。ReviewBench 8 个改动小于
+300 行的测试 PR，各跑 1 次，judge 为 gpt-5.5，对照 rb-test-v1 里同样 8 个 PR。
+
+| | rb-test-v1 | refute |
+|---|---:|---:|
+| Grounded P / R（微平均） | 84.2% / 32.3% | 84.2% / 27.7% |
+| Augmented P / R（微平均） | 85.3% / 43.6% | 81.8% / 38.2% |
+| 去重后候选 / findings | 87 / 34 | 67 / 33 |
+| keep / revise / rejected / inconclusive | 25 / 9 / 47 / 6 | 23 / 7 / 34 / 3 |
+| 未命中 / 命中 / 输出 tokens | 307K / 736K / 142K | 304K / 620K / 126K |
+
+judge 成本 $2.32。驳回率只从 54% 降到 51%，提示词放松几乎没改变 verify 行为；
+召回下降主要来自这次 discover 产出的候选少了 20 个，属于采样波动。
+
+结论：没有明显变好，按规则停止，不设为默认。只有 1 次、8 个 PR，不能说 refute 更差。
