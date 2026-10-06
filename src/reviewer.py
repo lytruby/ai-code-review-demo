@@ -40,6 +40,11 @@ DISCOVERY_SAMPLES = 2
 # Discovery requests are independent, so after the first one has cached the
 # shared prefix the rest run concurrently.
 DISCOVERY_WORKERS = 4
+# Unit discovery splits the diff into at most this many units, one request
+# each, so a case costs about as many discovery requests as the passes mode.
+MAX_DISCOVERY_UNITS = 8
+UNIT_CONTEXT_LINES = 30
+DISCOVERY_MODES = ("passes", "units")
 MAX_DISCOVER_TURNS = 2
 MAX_DEDUPLICATE_TURNS = 2
 MAX_CONTEXT_TOOL_CALLS_PER_FACT = 4
@@ -198,6 +203,27 @@ concerns in this pass.
 """,
     ),
 )
+
+UNIT_DISCOVERY_PROMPT = """\
+Review only the unit below, which is one part of the changes above. Check every
+changed line in this unit against each item of this checklist:
+- runtime correctness: types and signatures, null/undefined and falsy values
+  such as 0 or empty strings, boundary and off-by-one conditions, control flow
+  that cannot work as written, invalid API usage;
+- comparisons and matching: equality on objects or dates, regular expressions
+  and string matching that accept or reject the wrong input;
+- state and concurrency: non-atomic updates, races, transactions, lifecycle and
+  cleanup, inconsistent state transitions;
+- consistency: names, messages, defaults, serialization and contracts that
+  disagree with the rest of the change or with the previous behavior;
+- error handling: failures that are ignored, cached, or reported as success;
+- security: untrusted input reaching queries, commands, paths, URLs or HTML,
+  and weakened checks;
+- tests: wrong expected values, assertions that cannot fail, mocks that bypass
+  the behavior under test, timing races.
+The surrounding code is shown only for context. Evidence must quote the
+changes above, not the surrounding code.
+"""
 
 DEDUPLICATE_PROMPT = """\
 Stage: DEDUPLICATE
@@ -392,7 +418,11 @@ class OpenAIReviewer(Reviewer):
         max_candidates=None,
         discovery_passes=None,
         discovery_samples=None,
+        discovery_mode="passes",
     ):
+        if discovery_mode not in DISCOVERY_MODES:
+            raise ValueError(f"discovery_mode must be one of {DISCOVERY_MODES}")
+        self.discovery_mode = discovery_mode
         if not 1 <= candidates_per_pass <= MAX_CANDIDATES_PER_DISCOVERY_PASS:
             raise ValueError("candidates_per_pass is out of range")
         if discovery_samples is None:
@@ -530,7 +560,7 @@ class OpenAIReviewer(Reviewer):
             for change in changes
         )
 
-        state.candidates = self._discover(code_changes, state)
+        state.candidates = self._discover(code_changes, state, changes)
         state.stage = "verify"
         state.verified_issues = self._verify(code_changes, state)
         state.stage = "finalize"
@@ -572,7 +602,7 @@ class OpenAIReviewer(Reviewer):
             f"File: {change['filename']}\nPatch:\n{change['patch']}"
             for change in changes
         )
-        state.candidates = self._discover(code_changes, state)
+        state.candidates = self._discover(code_changes, state, changes)
         state.stage = "complete"
         return ReviewResult(
             summary=f"Discovery only: {len(state.candidates)} unverified candidate(s).",
@@ -588,7 +618,54 @@ class OpenAIReviewer(Reviewer):
             status="complete",
         )
 
-    def _discover(self, code_changes: str, state: ReviewState) -> list[CandidateIssue]:
+    def _discovery_units(self, changes) -> list[str]:
+        """Split the changes into at most MAX_DISCOVERY_UNITS review units."""
+        hunks = []
+        for change in changes:
+            for hunk in re.split(r"(?m)^(?=@@ )", change.get("patch") or ""):
+                if hunk.strip():
+                    hunks.append((change["filename"], hunk))
+        if not hunks:
+            return []
+        sizes = [hunk.count("\n") + 1 for _, hunk in hunks]
+        target = max(1, -(-sum(sizes) // MAX_DISCOVERY_UNITS))
+        while True:
+            groups, current, current_size = [], [], 0
+            for item, size in zip(hunks, sizes):
+                if current and current_size + size > target:
+                    groups.append(current)
+                    current, current_size = [], 0
+                current.append(item)
+                current_size += size
+            groups.append(current)
+            if len(groups) <= MAX_DISCOVERY_UNITS:
+                break
+            target = int(target * 1.25) + 1
+        return [
+            "\n\n".join(self._unit_hunk_text(filename, hunk) for filename, hunk in group)
+            for group in groups
+        ]
+
+    def _unit_hunk_text(self, filename: str, hunk: str) -> str:
+        text = f"File: {filename}\nHunk:\n{hunk.rstrip()}"
+        match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", hunk)
+        path = self.repository_root / filename
+        if not match or not path.is_file():
+            return text
+        start = int(match.group(1))
+        length = int(match.group(2) or 1)
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return text
+        first = max(1, start - UNIT_CONTEXT_LINES)
+        last = min(len(lines), start + length + UNIT_CONTEXT_LINES)
+        if first > last:
+            return text
+        context = "\n".join(f"{number}: {lines[number - 1]}" for number in range(first, last + 1))
+        return f"{text}\nSurrounding code after the change (lines {first}-{last}):\n{context}"
+
+    def _discover(self, code_changes: str, state: ReviewState, changes=None) -> list[CandidateIssue]:
         pass_candidates = []
         pass_rejection_counts = []
         successful_passes = 0
@@ -600,6 +677,14 @@ class OpenAIReviewer(Reviewer):
             for sample in range(self.discovery_samples)
             for name, prompt in self.discovery_passes
         ]
+        if self.discovery_mode == "units":
+            # Each unit is reviewed once against the full checklist instead of
+            # repeating category passes over the whole diff.
+            units = self._discovery_units(changes or [])
+            runs = [
+                (f"unit-{index + 1}", f"unit-{index + 1}", f"{UNIT_DISCOVERY_PROMPT}\n{unit}")
+                for index, unit in enumerate(units)
+            ] or runs
 
         def run_pass(run):
             run_name, pass_name, focus_prompt = run

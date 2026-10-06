@@ -1961,3 +1961,42 @@ def test_invalid_final_decision_gets_one_correction_turn(tmp_path):
     assert decision["verdict"] == "keep"
     assert len(issues) == 1
     assert "mention other files in the description" in completions.requests[-1]["messages"][-1]["content"]
+
+
+def test_unit_discovery_reviews_each_unit_with_surrounding_code(tmp_path):
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 81)))
+    changes = [
+        {"filename": "a.py", "patch": "@@ -10,1 +10,1 @@\n-old\n+line10\n@@ -60,1 +60,1 @@\n-old\n+line60"},
+        {"filename": "b.py", "patch": "@@ -0,0 +1,1 @@\n+x = 1"},
+    ]
+    completions = FakeCompletions(
+        [response('{"candidates":[]}') for _ in range(3)], auto_empty_state_pass=False
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    reviewer = OpenAIReviewer(
+        client=client, repository_root=tmp_path, model="test", discovery_mode="units"
+    )
+
+    units = reviewer._discovery_units(changes)
+    assert len(units) == 3
+    assert "Surrounding code after the change (lines 1-41)" in units[0]
+    assert "30: line30" in units[0] and "31: line31" not in units[0].split("lines 1-41")[0]
+    assert "Surrounding code" not in units[2]  # b.py is not in the checkout
+
+    reviewer.discover_only(changes)
+    contents = [r["messages"][1]["content"] for r in completions.requests]
+    assert len(contents) == 3
+    assert all("Review only the unit below" in c for c in contents)
+    # Every unit request shares the diff as its cached prefix.
+    assert len({c.split("Discovery pass:")[0] for c in contents}) == 1
+
+
+def test_discovery_units_are_capped(tmp_path):
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions([])))
+    reviewer = OpenAIReviewer(client=client, repository_root=tmp_path, model="test", discovery_mode="units")
+    changes = [{"filename": f"f{i}.py", "patch": f"@@ -0,0 +1,{i + 1} @@\n" + "+x\n" * (i + 1)} for i in range(30)]
+    units = reviewer._discovery_units(changes)
+    assert 1 <= len(units) <= 8
+    assert sum(u.count("File: ") for u in units) == 30
+    with pytest.raises(ValueError):
+        OpenAIReviewer(client=client, repository_root=tmp_path, model="test", discovery_mode="files")

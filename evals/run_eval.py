@@ -197,7 +197,9 @@ def run_case(
             ) from error
         return result, getattr(reviewer, "last_trace", [])
 
-    if repository_cache is not None and not discover_only:
+    # Unit discovery shows the code around each hunk, so it needs the checkout.
+    needs_checkout = not discover_only or (reviewer_settings or {}).get("discovery_mode") == "units"
+    if repository_cache is not None and needs_checkout:
         repository_root = prepare_cached_repository(
             metadata,
             repository_cache,
@@ -208,7 +210,7 @@ def run_case(
         with tempfile.TemporaryDirectory(prefix=f"code-review-{case_id}-") as temp_dir:
             repository_root = Path(temp_dir)
             # Discovery reads only the diff, so it needs no checkout.
-            if not discover_only:
+            if needs_checkout:
                 checkout(metadata, repository_root)
             result, trace = review_repository(repository_root)
 
