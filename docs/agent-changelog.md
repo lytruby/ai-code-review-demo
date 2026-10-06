@@ -2739,3 +2739,29 @@ file 不一致时更清楚的报错，这两项是协议层面的修复，和具
 - `report_rule`（CLI `--report-rule certainty=4,worth_reporting=3`）由程序按最低分过滤；
   默认不过滤，先跑一次收集分数，再按结果定阈值。
 - 打分说明放在 VERIFY_PROMPT（system）里，不影响缓存前缀。
+
+### 2026-10-06 结果：valfull-score-r1（63ad42b，完整 review，不过滤，1 次）
+
+| | valfull-s2-r1 / r2（已有） | valfull-score-r1 |
+|---|---|---|
+| Core R | 55% / 52.5% | 57.5% |
+| Core P | 25.9% / 29.2% | 30.3% |
+| Core F1 | 35–37% | 39.7% |
+| TP / FP | 22 / 63，21 / 51 | 23 / 53 |
+| 未缓存 / 缓存 / 输出 tokens | 1.09M / 4.93M / 405k，1.07M / 3.73M / 355k | 821k / 3.91M / 368k |
+
+- verify 未缓存从约 800k 降到 555k（约 -30%），收尾轮保留工具的缓存修复生效。
+- 用时 66 分钟（`--jobs 2`），没有超时或 429。
+- 召回、精确率和 s2 在同一范围，撤掉过拟合规则后没有变差。
+
+打分分析（88 条保留的问题，23 TP / 65 FP，未去重）：
+- certainty：3 档 0/6，4 档 6/28，5 档 17/31；没有 1、2。
+- impact：1 档 4/5，2 档 7/18，3 档 6/30，4 档 6/11，5 档 0/1。
+- worth_reporting：2 档 2/8，3 档 6/17，4 档 7/27，5 档 8/13。
+- 规则（剩下的 TP/FP）：certainty>=4 为 23/59；worth_reporting>=3 为 21/57；
+  worth_reporting>=4 为 15/40；certainty>=4 且 worth_reporting>=3 为 21/52；
+  impact>=3 为 12/42。
+- FP 集中在 cal_dot_com-8330（16 条）和 discourse-benchmark-1（15 条）。
+
+结论：模型给自己的打分基本区分不了 TP 和 FP，impact 甚至反向。只有
+certainty>=4 去掉 6 条 FP 不丢 TP，但样本只有 6 条。默认仍不过滤。
