@@ -213,6 +213,7 @@ def main() -> None:
     parser.add_argument("--max-lines", type=int, help="Only PRs with fewer added+removed lines than this")
     parser.add_argument("--report-rule", help="e.g. certainty=4")
     parser.add_argument("--verify-policy", choices=("strict", "refute"))
+    parser.add_argument("--discovery-questions", action="store_true")
     parser.add_argument("--judge-provider", default="openai")
     # The judge's model registry has no gpt-6.1-sol; gpt-5.5 is its newest OpenAI model.
     parser.add_argument("--judge-model", default="gpt-5.5")
@@ -223,6 +224,8 @@ def main() -> None:
     if args.report_rule:
         settings["report_rule"] = {name.strip(): int(value) for name, value in
                                    (item.split("=") for item in args.report_rule.split(","))}
+    if args.discovery_questions:
+        settings["discovery_questions"] = True
     if args.verify_policy:
         settings["verify_policy"] = args.verify_policy
     if args.command == "review":

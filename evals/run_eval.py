@@ -204,6 +204,7 @@ def run_case(
         or settings.get("discovery_mode") == "units"
         or settings.get("discovery_context", "none") != "none"
         or settings.get("discovery_tools", False)
+        or settings.get("discovery_questions", False)
     )
     if repository_cache is not None and needs_checkout:
         repository_root = prepare_cached_repository(

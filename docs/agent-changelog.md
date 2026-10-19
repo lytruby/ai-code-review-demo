@@ -2816,3 +2816,20 @@ judge 成本 $2.32。驳回率只从 54% 降到 51%，提示词放松几乎没�
 召回下降主要来自这次 discover 产出的候选少了 20 个，属于采样波动。
 
 结论：没有明显变好，按规则停止，不设为默认。只有 1 次、8 个 PR，不能说 refute 更差。
+
+## 2026-10-19：清单条目驱动的上下文获取（`--discovery-questions`），待验证
+
+前两种做法都不理想：程序预先塞调用方代码（新增 2 个、丢 7 个，相关代码在里面也
+没注意到）；让模型自己调工具（60% 一次不调，还会开始自己验证、放弃候选）。改成
+由清单里的具体条目驱动取上下文：
+
+- 原有 discover pass 不变。之后多一轮无工具的提问请求，复用同样的 system prompt
+  和 diff 前缀，按清单（callers / definition / tests）只在条目适用、diff 里看不到
+  答案时提出问题，每个问题指向 diff 里出现的一个标识符，最多 6 个。
+- 程序按条目用 rg 取代码：callers 取非测试的调用点，definition 取定义，tests 取
+  测试里的用法，每个问题最多 4000 字符；取不到就不跑。
+- 每个有代码的问题跑一个 discover pass，只回答这个问题，候选并入原有候选再去重。
+- 默认关闭，`benchmark run` 和 `reviewbench review` 都可加 `--discovery-questions`。
+
+计划验证：15 个 val 案例 discover-only，对照 val-samp2 的 28/40 core golden，并统计
+只由问题 pass 找到的命中。

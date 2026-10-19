@@ -27,7 +27,7 @@ from src.models import (
     ReviewResult,
     review_issue_from_dict,
 )
-from src.change_context import build_change_context
+from src.change_context import QUESTION_ITEMS, build_change_context, fetch_question_context
 from src.locate import locate_issue
 from src.tools import READ_FILE_TOOL, SEARCH_CODE_TOOL
 from src.tool_gateway import ToolGateway, ToolProposal
@@ -49,6 +49,7 @@ UNIT_CONTEXT_LINES = 30
 DISCOVERY_MODES = ("passes", "units")
 DISCOVERY_CONTEXTS = ("none", "callers")
 MAX_DISCOVER_TURNS = 2
+MAX_DISCOVERY_QUESTIONS = 6
 # Repository tool calls each discovery request may make when discovery_tools is on.
 DISCOVER_TOOL_CALLS_PER_PASS = 3
 MAX_DEDUPLICATE_TURNS = 2
@@ -239,6 +240,36 @@ changed line in this unit against each item of this checklist:
 The surrounding code is shown only for context. Evidence must quote the
 changes above, not the surrounding code.
 """
+
+QUESTION_PLAN_PROMPT = f"""\
+Question step. Do not return candidates in this step. Walk this checklist over
+the changes above and write a question only where an item applies and the
+answer is not visible in the diff:
+- callers: a changed function, method or class whose behavior, signature,
+  return value or errors changed; ask whether its existing callers still work;
+- definition: a function or class the change starts calling or calls
+  differently; ask whether the call matches what it expects or returns;
+- tests: changed behavior; ask whether existing tests of that symbol still
+  hold or now assert the wrong thing.
+symbol must be one exact identifier that appears in the changes. Return at most
+{MAX_DISCOVERY_QUESTIONS} questions, most likely to reveal a defect first, and an empty list when
+none apply. Return only valid JSON:
+{{"questions": [{{"item": "callers | definition | tests", "symbol": "identifier",
+"file": "changed file where the symbol appears", "question": "One concrete question"}}]}}
+"""
+
+QUESTION_ANSWER_PROMPT = """\
+Answer only this question about the changes, using the repository code below
+from the head commit:
+{question}
+
+Repository code ({item} of {symbol}):
+{context}
+
+Return a candidate only when this code and the changes show a concrete defect
+in the changes. Evidence must quote the changes above, not the repository code.
+Return an empty candidates list when the code answers the question without a
+defect."""
 
 DEDUPLICATE_PROMPT = """\
 Stage: DEDUPLICATE
@@ -449,6 +480,7 @@ class OpenAIReviewer(Reviewer):
         discovery_tools=False,
         report_rule=None,
         verify_policy="strict",
+        discovery_questions=False,
     ):
         if verify_policy not in VERIFY_POLICIES:
             raise ValueError(f"verify_policy must be one of {VERIFY_POLICIES}")
@@ -461,6 +493,9 @@ class OpenAIReviewer(Reviewer):
         self.discovery_mode = discovery_mode
         self.discovery_context = discovery_context
         self.discovery_tools = bool(discovery_tools)
+        # Ask concrete questions, fetch the code that answers them, then discover
+        # once per question; adds candidates on top of the regular passes.
+        self.discovery_questions = bool(discovery_questions)
         # Minimum verify scores for an issue to be reported, e.g.
         # {"certainty": 4, "worth_reporting": 3}; None reports every kept issue.
         report_rule = dict(report_rule or {})
@@ -505,6 +540,8 @@ class OpenAIReviewer(Reviewer):
             )
             self.max_tool_calls += DISCOVER_TOOL_CALLS_PER_PASS * discovery_requests
             self.max_model_turns += DISCOVER_TOOL_CALLS_PER_PASS * discovery_requests
+        if self.discovery_questions:
+            self.max_model_turns += (1 + MAX_DISCOVERY_QUESTIONS) * MAX_DISCOVER_TURNS
         configured_model = model or os.environ.get("LLM_MODEL")
         self.provider = self._resolve_provider(provider, configured_model)
         self.request_timeout = float(os.environ.get("LLM_TIMEOUT", "120"))
@@ -789,6 +826,20 @@ class OpenAIReviewer(Reviewer):
             pass_candidates.append(candidates)
             pass_rejection_counts.append(rejection_count)
 
+        if self.discovery_questions:
+            question_runs = [
+                (f"question-{index + 1}", f"question-{index + 1}", prompt)
+                for index, prompt in enumerate(self._question_prompts(code_changes, state))
+            ]
+            if question_runs:
+                with ThreadPoolExecutor(max_workers=DISCOVERY_WORKERS) as executor:
+                    question_outcomes = list(executor.map(run_pass, question_runs))
+                runs += question_runs
+                for outcome in question_outcomes:
+                    candidates, rejection_count = outcome or ([], 0)
+                    pass_candidates.append(candidates)
+                    pass_rejection_counts.append(rejection_count)
+
         if successful_passes == 0:
             raise ValueError("DISCOVER did not return valid candidates")
 
@@ -932,6 +983,76 @@ class OpenAIReviewer(Reviewer):
             evidence=evidence,
             required_facts=required_facts,
         )
+
+    def _question_prompts(self, code_changes: str, state: ReviewState) -> list[str]:
+        """Plan discovery questions and return one answer prompt per question with code."""
+        messages = [
+            {
+                "role": "system",
+                "content": f"{REVIEW_PROMPT}\n\n" + DISCOVER_PROMPT.replace(
+                    "{max_candidates}", str(self.candidates_per_pass)
+                ).replace(
+                    DISCOVER_NO_TOOLS,
+                    DISCOVER_WITH_TOOLS if self.discovery_tools else DISCOVER_NO_TOOLS,
+                ),
+            },
+            # Same system prompt and diff as the discovery passes, so the prefix is cached.
+            {"role": "user", "content": f"Untrusted changes:\n\n{code_changes}\n\n{QUESTION_PLAN_PROMPT}"},
+        ]
+        questions = None
+        for _ in range(MAX_DISCOVER_TURNS):
+            message = self._request(messages, state, allow_tools=False)
+            self._append_assistant(messages, message)
+            try:
+                questions = self._parse_questions(message.content or "", code_changes)
+                break
+            except ValueError as error:
+                self._append_feedback(messages, state, f"Invalid question output: {error}")
+        prompts, trace_questions = [], []
+        for question in questions or []:
+            context = fetch_question_context(question["item"], question["symbol"], self.repository_root)
+            trace_questions.append({**question, "context_characters": len(context)})
+            if context:
+                prompts.append(
+                    QUESTION_ANSWER_PROMPT.replace("{question}", question["question"])
+                    .replace("{item}", question["item"])
+                    .replace("{symbol}", question["symbol"])
+                    .replace("{context}", context)
+                )
+        state.trace.append(
+            {
+                "type": "discovery_questions",
+                "stage": "discover",
+                "parsed": questions is not None,
+                "questions": trace_questions,
+            }
+        )
+        return prompts
+
+    @classmethod
+    def _parse_questions(cls, output_text: str, code_changes: str) -> list[dict]:
+        data = cls._parse_json_object(output_text)
+        raw_questions = data.get("questions")
+        if not isinstance(raw_questions, list):
+            raise ValueError("questions must be a list")
+        questions, seen = [], set()
+        for raw in raw_questions:
+            if not isinstance(raw, dict):
+                continue
+            item, symbol, question = raw.get("item"), raw.get("symbol"), raw.get("question")
+            if item not in QUESTION_ITEMS or not isinstance(question, str) or not question.strip():
+                continue
+            # The symbol must be an identifier the diff actually contains.
+            if not isinstance(symbol, str) or not re.fullmatch(r"[A-Za-z_$][\w$]*", symbol):
+                continue
+            if not re.search(rf"(?<![\w$]){re.escape(symbol)}(?![\w$])", code_changes):
+                continue
+            if (item, symbol) in seen:
+                continue
+            seen.add((item, symbol))
+            file = raw.get("file") if isinstance(raw.get("file"), str) else ""
+            questions.append({"item": item, "symbol": symbol, "file": file, "question": question.strip()})
+        return questions[:MAX_DISCOVERY_QUESTIONS]
 
     def _discover_pass(
         self,

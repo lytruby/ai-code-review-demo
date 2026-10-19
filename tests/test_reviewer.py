@@ -2166,3 +2166,95 @@ def test_refute_policy_reports_inconclusive_candidates_unverified():
 
     assert decision["reported_unverified"] is True
     assert [(i.file, i.description, i.start_line) for i in issues] == [("example.py", "Possible bug", 1)]
+
+
+def test_question_context_fetches_definition_callers_and_tests(tmp_path):
+    from src.change_context import fetch_question_context
+
+    (tmp_path / "lib.py").write_text("def compute_total(items):\n    return sum(items)\n")
+    (tmp_path / "app.py").write_text("def checkout(cart):\n    return compute_total(cart)\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_lib.py").write_text("assert compute_total([1]) == 1\n")
+
+    definition = fetch_question_context("definition", "compute_total", tmp_path)
+    assert definition.startswith("lib.py:1") and "app.py" not in definition
+    callers = fetch_question_context("callers", "compute_total", tmp_path)
+    assert "app.py:2" in callers and "test_lib.py" not in callers and "lib.py:1" not in callers
+    tests = fetch_question_context("tests", "compute_total", tmp_path)
+    assert "tests/test_lib.py:1" in tests and "app.py" not in tests
+    assert fetch_question_context("callers", "compute_total", None) == ""
+    assert fetch_question_context("callers", "missing_name", tmp_path) == ""
+    assert fetch_question_context("anything", "compute_total", tmp_path) == ""
+
+
+def test_parse_questions_keeps_valid_unique_symbols_from_the_diff():
+    from src.reviewer import MAX_DISCOVERY_QUESTIONS
+
+    diff = "+ value = compute_total(items)\n" + "".join(f"+ f{i}()\n" for i in range(10))
+    raw = [
+        {"item": "callers", "symbol": "compute_total", "question": "Do callers pass a list?"},
+        {"item": "callers", "symbol": "compute_total", "question": "Duplicate"},
+        {"item": "style", "symbol": "compute_total", "question": "Bad item"},
+        {"item": "definition", "symbol": "compute", "question": "Not a whole word in the diff"},
+        {"item": "definition", "symbol": "a.b", "question": "Not an identifier"},
+        {"item": "tests", "symbol": "compute_total", "question": " "},
+    ] + [{"item": "definition", "symbol": f"f{i}", "question": "q"} for i in range(10)]
+    questions = OpenAIReviewer._parse_questions(json.dumps({"questions": raw}), diff)
+    assert questions[0] == {
+        "item": "callers", "symbol": "compute_total", "file": "", "question": "Do callers pass a list?"
+    }
+    assert len(questions) == MAX_DISCOVERY_QUESTIONS
+    assert [q["symbol"] for q in questions[1:]] == [f"f{i}" for i in range(MAX_DISCOVERY_QUESTIONS - 1)]
+    with pytest.raises(ValueError):
+        OpenAIReviewer._parse_questions('{"questions": "none"}', diff)
+
+
+def test_discovery_questions_fetch_code_and_add_candidates(tmp_path):
+    (tmp_path / "lib.py").write_text("def compute_total(items, discount):\n    return sum(items) - discount\n")
+    (tmp_path / "app.py").write_text("def checkout(cart):\n    return compute_total(cart.items)\n")
+    changes = [{"filename": "lib.py", "patch": "@@ -1,2 +1,2 @@\n-def compute_total(items):\n+def compute_total(items, discount):\n     return sum(items) - discount"}]
+    plan = json.dumps({"questions": [
+        {"item": "callers", "symbol": "compute_total", "file": "lib.py", "question": "Do callers pass discount?"},
+        {"item": "tests", "symbol": "compute_total", "file": "lib.py", "question": "No tests exist"},
+    ]})
+    candidate = (
+        '{"candidates":[{"file":"lib.py","severity":"high",'
+        '"claim":"checkout still calls compute_total without discount",'
+        '"evidence":[{"side":"after","text":"def compute_total(items, discount):"}],'
+        '"required_facts":[]}]}'
+    )
+    completions = FakeCompletions(
+        [response('{"candidates":[]}') for _ in range(4)] + [response("not json"), response(plan), response(candidate)],
+        auto_empty_state_pass=False,
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    reviewer = OpenAIReviewer(client=client, repository_root=tmp_path, model="test", discovery_questions=True)
+    result = reviewer.discover_only(changes)
+
+    assert [issue.description for issue in result.issues] == ["checkout still calls compute_total without discount"]
+    plan_request, question_request = completions.requests[5], completions.requests[6]
+    # The plan and question requests share the passes' system prompt and diff prefix.
+    pass_user = completions.requests[0]["messages"][1]["content"]
+    prefix = pass_user.split("Discovery pass:")[0]
+    for request in (plan_request, question_request):
+        assert request["messages"][0]["content"] == completions.requests[0]["messages"][0]["content"]
+        assert request["messages"][1]["content"].startswith(prefix)
+    question_prompt = question_request["messages"][1]["content"]
+    assert "Discovery pass: question-1" in question_prompt
+    assert "Do callers pass discount?" in question_prompt
+    assert "app.py:2" in question_prompt
+    # The tests question finds no test code, so no pass runs for it.
+    assert len(completions.requests) == 7
+    trace = next(e for e in reviewer.last_trace if e["type"] == "discovery_questions")
+    assert trace["parsed"] is True
+    assert [q["context_characters"] > 0 for q in trace["questions"]] == [True, False]
+
+
+def test_discovery_questions_are_off_by_default(tmp_path):
+    (tmp_path / "lib.py").write_text("def f():\n    return 1\n")
+    changes = [{"filename": "lib.py", "patch": "@@ -1,2 +1,2 @@\n def f():\n-    return 0\n+    return 1"}]
+    completions = FakeCompletions([response('{"candidates":[]}')])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    reviewer = OpenAIReviewer(client=client, repository_root=tmp_path, model="test")
+    reviewer.discover_only(changes)
+    assert not any("Question step" in json.dumps(r["messages"]) for r in completions.requests)

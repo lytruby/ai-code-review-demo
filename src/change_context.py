@@ -160,3 +160,41 @@ def build_change_context(changes, repository_root: Path | None) -> str:
             break
         text += section + "\n\n"
     return text.strip()
+
+
+QUESTION_ITEMS = ("callers", "definition", "tests")
+QUESTION_SITE_CONTEXT_LINES = 4
+QUESTION_DEFINITION_LINES = 15
+MAX_QUESTION_CONTEXT_CHARS = 4_000
+
+
+def _is_test_path(path: str) -> bool:
+    return bool(re.search(r"(^|/)(tests?|__tests__|spec)(/|$)|[._-](test|spec)\.\w+$|(^|/)test_", path))
+
+
+def fetch_question_context(item: str, symbol: str, repository_root: Path | None) -> str:
+    """Return head-commit code that can answer one discovery question, or ""."""
+    if item not in QUESTION_ITEMS or repository_root is None or not Path(repository_root).is_dir():
+        return ""
+    root = Path(repository_root)
+    matches = _matches(symbol, root)
+    if not matches:
+        return ""
+    definitions = [m for m in matches if symbol in _defined_names(m["content"])]
+    if item == "definition":
+        picked, before, after = definitions[:2], 0, QUESTION_DEFINITION_LINES
+    elif item == "callers":
+        sites = [m for m in matches if m not in definitions and not _is_test_path(_normalize(m["path"]))]
+        picked, before, after = sites[:MAX_SITES_PER_SYMBOL], QUESTION_SITE_CONTEXT_LINES, QUESTION_SITE_CONTEXT_LINES
+    else:
+        sites = [m for m in matches if _is_test_path(_normalize(m["path"]))]
+        picked, before, after = sites[:MAX_SITES_PER_SYMBOL], QUESTION_SITE_CONTEXT_LINES, QUESTION_SITE_CONTEXT_LINES
+    text = ""
+    for match in picked:
+        block = f"{_normalize(match['path'])}:{match['line']}\n" + _excerpt(
+            root, match["path"], match["line"], before, after
+        )
+        if len(text) + len(block) > MAX_QUESTION_CONTEXT_CHARS:
+            break
+        text += block + "\n\n"
+    return text.strip()
